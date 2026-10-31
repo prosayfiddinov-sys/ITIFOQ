@@ -641,10 +641,13 @@ def get_user_mention_entities(
             offset=0,
             length=utf16_length(mention),
         )]
+    user_id = getattr(user, "id", None)
+    if user_id is None:
+        return []
     return [MessageEntityMentionName(
         offset=0,
         length=utf16_length(mention),
-        user_id=user.id,
+        user_id=int(user_id),
     )]
 
 
@@ -746,7 +749,8 @@ def make_bot_random_tag(user_id: str, username: str | None, fullname: str, word:
         profile_url = f"https://t.me/{html.escape(clean_username)}"
     else:
         display_name = fullname.strip() if fullname.strip() else "A'zo"
-        profile_url = f"tg://user?id={html.escape(str(user_id))}"
+        profile_user_id = str(user_id).strip()
+        profile_url = f"tg://user?id={html.escape(profile_user_id)}"
 
     display_name = html.escape(display_name)
     mention = f'<a href="{profile_url}">{display_name}</a>'
