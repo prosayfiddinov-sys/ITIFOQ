@@ -36,7 +36,7 @@ from telethon.errors import (
 )
 from telethon.tl.types import (
     UserStatusOnline, Chat, DocumentAttributeCustomEmoji, InputStickerSetShortName,
-    MessageEntityCustomEmoji, MessageEntityMention, MessageEntityMentionName,
+    MessageEntityCustomEmoji, MessageEntityMentionName,
     ChannelParticipantsAdmins,
 )
 from telethon.utils import get_display_name, get_peer_id
@@ -634,13 +634,7 @@ def get_user_mention_name(user) -> str:
 def get_user_mention_entities(
     user,
     mention: str,
-) -> list[MessageEntityMentionName | MessageEntityMention]:
-    username = str(getattr(user, "username", "") or "").strip().lstrip("@")
-    if username:
-        return [MessageEntityMention(
-            offset=0,
-            length=utf16_length(mention),
-        )]
+) -> list[MessageEntityMentionName]:
     user_id = getattr(user, "id", None)
     if user_id is None:
         return []
@@ -732,12 +726,12 @@ def make_random_utag_text(
     user,
     custom_emoji: tuple[int, str] | None = None,
     random_words: list[str] | None = None,
-) -> tuple[str, list[MessageEntityMention | MessageEntityMentionName]]:
+) -> tuple[str, list[MessageEntityMentionName]]:
     """Username va guruh/bot so'zlari bilan random uTag."""
     mention = get_user_mention_name(user)
     word = random.choice(random_words or RANDOM_UTAG_WORDS)
     text = f"{mention}, {word}"
-    entities: list[MessageEntityMention | MessageEntityMentionName] = []
+    entities: list[MessageEntityMentionName] = []
     entities.extend(get_user_mention_entities(user, mention))
     return text, entities
 
@@ -746,13 +740,11 @@ def make_bot_random_tag(user_id: str, username: str | None, fullname: str, word:
     clean_username = str(username or "").strip().lstrip("@")
     if clean_username:
         display_name = f"@{clean_username}"
-        profile_url = f"https://t.me/{html.escape(clean_username)}"
     else:
         display_name = fullname.strip() if fullname.strip() else "A'zo"
-        profile_user_id = str(user_id).strip()
-        profile_url = f"tg://user?id={html.escape(profile_user_id)}"
 
     display_name = html.escape(display_name)
+    profile_url = f"tg://user?id={html.escape(str(user_id).strip())}"
     mention = f'<a href="{profile_url}">{display_name}</a>'
     return f"{mention}, {html.escape(word)}"
 
@@ -2285,7 +2277,7 @@ async def do_utag(client: TelegramClient, uid: str, event, random_mode: bool = F
 
         async def send_member_tag(
             text: str,
-            entities: list[MessageEntityCustomEmoji | MessageEntityMention | MessageEntityMentionName],
+            entities: list[MessageEntityCustomEmoji | MessageEntityMentionName],
         ):
             nonlocal tagged
             while True:
@@ -2303,7 +2295,7 @@ async def do_utag(client: TelegramClient, uid: str, event, random_mode: bool = F
                 except (PremiumAccountRequiredError, EntityBoundsInvalidError):
                     mention_entities = [
                         entity for entity in entities
-                        if isinstance(entity, (MessageEntityMention, MessageEntityMentionName))
+                        if isinstance(entity, MessageEntityMentionName)
                     ]
                     while True:
                         try:
