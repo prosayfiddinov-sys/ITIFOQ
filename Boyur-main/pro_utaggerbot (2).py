@@ -43,7 +43,7 @@ from telethon.utils import get_display_name, get_peer_id
 from telethon.tl.functions.messages import GetStickerSetRequest, AddChatUserRequest
 from telethon.tl.functions.channels import InviteToChannelRequest, GetParticipantsRequest
 from telethon.tl.functions.account import UpdateProfileRequest
-from telethon.tl.functions.users import GetFullUserRequest
+from telethon.tl.functions.users import GetFullUserRequest, GetUsersRequest
 from urllib.parse import urlparse
 from telethon.utils import get_display_name, get_peer_id
 
@@ -3067,6 +3067,28 @@ async def run_scrape_for_count(
                     offset += len(users)
             except Exception as exc:
                 log.warning("Participants manual fallback xatosi (%s): %s", uid, exc)
+
+        missing_username_ids = [
+            user_id for user_id, (user_ref, _, _) in found.items()
+            if not user_ref.startswith("@")
+        ]
+        for start in range(0, len(missing_username_ids), 100):
+            user_ids = missing_username_ids[start:start + 100]
+            try:
+                resolved_users = await client(GetUsersRequest(user_ids))
+                for resolved in resolved_users:
+                    resolved_id = getattr(resolved, "id", None)
+                    resolved_username = getattr(resolved, "username", None)
+                    if not resolved_id or not resolved_username:
+                        continue
+                    _, fullname, telegram_id = found[int(resolved_id)]
+                    found[int(resolved_id)] = (
+                        f"@{resolved_username}",
+                        fullname or get_display_name(resolved).strip(),
+                        telegram_id,
+                    )
+            except Exception as exc:
+                log.warning("Username resolve xatosi: %s", exc)
 
         try:
             await status.edit_text(
