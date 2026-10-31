@@ -3012,6 +3012,25 @@ async def run_scrape_for_count(
                 except Exception:
                     pass
 
+        if len(found) < participant_limit:
+            try:
+                participants = await client.get_participants(group, limit=participant_limit)
+                for participant in participants:
+                    if getattr(participant, "bot", False):
+                        continue
+                    participant_id = getattr(participant, "id", None)
+                    if not participant_id or participant_id == me.id or participant_id in found:
+                        continue
+                    participant_username = getattr(participant, "username", None)
+                    user_ref = f"@{participant_username}" if participant_username else str(participant_id)
+                    found[int(participant_id)] = (
+                        user_ref,
+                        get_display_name(participant).strip(),
+                        str(participant_id),
+                    )
+            except Exception as exc:
+                log.warning("Participants fallback xatosi (%s): %s", uid, exc)
+
         try:
             await status.edit_text(
                 f"✅ <b>{html.escape(group_title)}</b> guruhidan yig'ildi\n\n"
@@ -3045,17 +3064,22 @@ async def run_scrape_for_count(
             f"✅ Foydalanuvchilar yig'ildi va bazaga saqlandi!\n\n"
             f"🆕 Yangi saqlanganlar: <b>{len(rows)}</b> ta\n"
             f"👥 Jami topilgan: <b>{len(found)}</b> ta\n\n"
-            "Ro'yxat shaxsiy chatga 150 tadan bo'lib yuboriladi.",
+            "Username'lar, keyin ID'larsiz username'li user ID'lari yuboriladi.",
             reply_markup=await get_user_main_keyboard(uid)
         )
         username_users = sorted({
             username for username, _, _ in found.values()
             if username.startswith("@")
         })
-        if username_users:
+        id_users = sorted({
+            telegram_id for username, _, telegram_id in found.values()
+            if not username.startswith("@")
+        }, key=int)
+        output_lines = username_users + id_users
+        if output_lines:
             batch: list[str] = []
             batch_chars = 0
-            for display in username_users:
+            for display in output_lines:
                 extra_chars = len(display) + (1 if batch else 0)
                 if batch and (batch_chars + extra_chars > 3900):
                     await bot.send_message(chat_id=int(uid), text="\n".join(batch))
