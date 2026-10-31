@@ -212,14 +212,12 @@ class UserStatesGroup(StatesGroup):
     admin_raid_profile     = State()
     admin_custom_emoji_pack = State()
     admin_give_pro         = State()
-    admin_clone_price      = State()
     admin_pro_price        = State()
     member_add_package     = State()
     member_add_group       = State()
     member_add_admin       = State()
     member_add_users       = State()
     admin_member_add_price = State()
-    clone_token_input      = State()
     contest_channel        = State()
     contest_max_users      = State()
     contest_req_channels   = State()
@@ -1166,8 +1164,6 @@ def get_main_keyboard(
         InlineKeyboardButton(text="📜 Qoidalar", callback_data="rules"),
         InlineKeyboardButton(text="💰 Tariflar", callback_data="prices")
     )
-    if not is_clone_bot():
-        kb.row(InlineKeyboardButton(text="🤖 O'z botimni yaratish", callback_data="clone_buy"))
     return kb.as_markup()
 
 
@@ -1881,47 +1877,6 @@ async def get_pro_price() -> int:
         return 100
 
 
-@dp.callback_query(F.data == "clone_buy")
-async def cb_clone_buy(callback: CallbackQuery, state: FSMContext):
-    if is_clone_bot():
-        await callback.answer("Klon sotib olish faqat asosiy bot orqali mumkin.", show_alert=True)
-        return
-    if not CLONE_TOKEN_ENCRYPTION_KEY:
-        await callback.answer("Klon sotib olish hozircha mavjud emas.", show_alert=True)
-        return
-    price = await get_clone_price()
-    order_id = os.urandom(12).hex()
-    payload = f"clone:{callback.from_user.id}:{order_id}"
-    status = "paid" if price == 0 else "pending"
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute(
-            "INSERT INTO clone_orders (id, user_id, payload, amount, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (order_id, str(callback.from_user.id), payload, price, status,
-             datetime.now(timezone.utc).isoformat())
-        )
-        await db.commit()
-    if price == 0:
-        await state.update_data(clone_order_id=order_id)
-        await state.set_state(UserStatesGroup.clone_token_input)
-        await callback.message.answer(
-            "Klon bepul. @BotFather orqali bot yarating va uning tokenini shu yerga yuboring. "
-            "Token shifrlangan holda saqlanadi va qayta ko'rsatilmaydi."
-        )
-        await callback.answer()
-        return
-    await callback.message.answer_invoice(
-        title="Shaxsiy Telegram bot",
-        description="Bot nusxangizni umumiy tizimga ulash.",
-        payload=payload,
-        provider_token="",
-        currency="XTR",
-        prices=[LabeledPrice(label="Bot nusxasi", amount=price)],
-        start_parameter="create-clone",
-    )
-    await callback.answer()
-
-
 @dp.callback_query(F.data == "buy_pro_stars")
 async def cb_buy_pro_stars(callback: CallbackQuery):
     price = await get_pro_price()
@@ -2076,98 +2031,8 @@ async def clone_payment_success(message: Message, state: FSMContext):
         except Exception as exc:
             log.warning("Ownerga to'lov bildirishi yuborilmadi: %s", exc)
         return
-    async with aiosqlite.connect(DB_FILE) as db:
-        cursor = await db.execute(
-            "UPDATE clone_orders SET status = 'paid', telegram_charge_id = ? "
-            "WHERE payload = ? AND user_id = ? AND amount = ? AND status = 'pending'",
-            (payment.telegram_payment_charge_id, payment.invoice_payload,
-             str(message.from_user.id), payment.total_amount)
-        )
-        await db.commit()
-    if cursor.rowcount != 1:
-        await message.answer("Buyurtma topilmadi yoki to'lov avval qayta ishlangan.")
-        return
-    order_id = payment.invoice_payload.rsplit(":", 1)[-1]
-    await state.update_data(clone_order_id=order_id)
-    await state.set_state(UserStatesGroup.clone_token_input)
-    await message.answer(
-        "To'lov qabul qilindi. @BotFather orqali bot yarating va uning tokenini shu yerga yuboring. "
-        "Token shifrlangan holda saqlanadi va qayta ko'rsatilmaydi.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="Sozlashni davom ettirish", callback_data="clone_continue")
-        ]])
-    )
+    await message.answer("Bot klonini yaratish funksiyasi o'chirilgan.")
 
-
-@dp.callback_query(F.data == "clone_continue")
-async def cb_clone_continue(callback: CallbackQuery, state: FSMContext):
-    if is_clone_bot():
-        await callback.answer("Klon sozlash faqat asosiy botda mumkin.", show_alert=True)
-        return
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute(
-            "SELECT id FROM clone_orders WHERE user_id = ? AND status = 'paid' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (str(callback.from_user.id),)
-        ) as cur:
-            order = await cur.fetchone()
-    if not order:
-        await callback.answer("Sozlash kutilayotgan to'langan buyurtma topilmadi.", show_alert=True)
-        return
-    await state.update_data(clone_order_id=order[0])
-    await state.set_state(UserStatesGroup.clone_token_input)
-    await callback.message.answer("@BotFather orqali yaratilgan bot tokenini yuboring.")
-    await callback.answer()
-
-
-@dp.message(StateFilter(UserStatesGroup.clone_token_input), F.text)
-async def clone_token_input(message: Message, state: FSMContext):
-    if is_clone_bot():
-        await message.answer("Klon bot qo'shish faqat asosiy botda mumkin.")
-        return
-    token = message.text.strip()
-    order_id = (await state.get_data()).get("clone_order_id")
-    if not order_id:
-        await state.clear()
-        await message.answer("To'langan buyurtma topilmadi. Klon sotib olishni qaytadan oching.")
-        return
-    if token == BOT_TOKEN:
-        await message.answer("Asosiy bot tokenini ulab bo'lmaydi. Boshqa bot tokenini yuboring.")
-        return
-    try:
-        encrypted_token = clone_token_cipher().encrypt(token.encode()).decode()
-        candidate = Bot(token=token)
-        try:
-            me = await candidate.get_me()
-        finally:
-            await candidate.session.close()
-    except (ValueError, InvalidToken, RuntimeError):
-        await message.answer("Token noto'g'ri. @BotFather orqali tekshirib, qayta yuboring.")
-        return
-    except Exception:
-        await message.answer("Tokenni tekshirib bo'lmadi. Tekshirib, qayta urinib ko'ring.")
-        return
-    if not me.username:
-        await message.answer("Bot username'ga ega bo'lishi kerak. @BotFather'da sozlab, qayta urinib ko'ring.")
-        return
-    try:
-        async with aiosqlite.connect(DB_FILE) as db:
-            await db.execute(
-                "INSERT INTO cloned_bots (bot_id, owner_id, username, token_encrypted, order_id, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (str(me.id), str(message.from_user.id), me.username, encrypted_token, order_id,
-                 datetime.now(timezone.utc).isoformat())
-            )
-            await db.execute("UPDATE clone_orders SET status = 'provisioned' WHERE id = ?", (order_id,))
-            await db.commit()
-    except aiosqlite.IntegrityError:
-        await message.answer("Bu bot allaqachon ulangan yoki buyurtma ishlatilgan.")
-        return
-    await state.clear()
-    start_registered_clone(str(me.id), int(message.from_user.id), me.username, token)
-    await message.answer(
-        f"Tayyor. @{html.escape(me.username)} ulandi. Egasi paneli /admin buyrug'i orqali ochiladi."
-    )
 
 @dp.callback_query(F.data == "settings_my_ref")
 async def cb_my_ref(callback: CallbackQuery):
@@ -4323,7 +4188,7 @@ def get_admin_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     if not is_clone_bot():
         kb.row(InlineKeyboardButton(text="📢 Kanallarni boshqarish", callback_data="admin_channels"))
-        kb.row(InlineKeyboardButton(text="🤖 Klonlar va Stars narxi", callback_data="admin_clone_settings"))
+        kb.row(InlineKeyboardButton(text="⭐ PRO Stars narxi", callback_data="admin_clone_settings"))
     kb.row(InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="admin_users"))
     kb.row(InlineKeyboardButton(text="⭐ PRO berish", callback_data="admin_give_pro"))
     kb.row(InlineKeyboardButton(text="🎉 Konkurs yaratish", callback_data="admin_contest_create"))
@@ -4502,60 +4367,15 @@ async def cb_admin_clone_settings(callback: CallbackQuery):
     if is_clone_bot() or not is_panel_owner(callback.from_user.id):
         await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
         return
-    clone_price = await get_clone_price()
     pro_price = await get_pro_price()
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute("SELECT COUNT(*) FROM cloned_bots WHERE active = 1") as cur:
-            clone_count = (await cur.fetchone())[0]
     kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text="💫 Narxni o'zgartirish", callback_data="admin_clone_price"))
     kb.row(InlineKeyboardButton(text="💎 PRO Stars narxini o'zgartirish", callback_data="admin_pro_price"))
-    kb.row(InlineKeyboardButton(text="📋 Klonlar ro'yxati", callback_data="admin_clones_list"))
     kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin_panel"))
     await callback.message.edit_text(
         "🤖 <b>Stars narxlari</b>\n\n"
-        f"Bot kloni: <b>{clone_price} Stars</b>\n"
         f"30 kunlik PRO: <b>{pro_price} Stars</b>\n"
-        f"Faol klonlar: <b>{clone_count}</b>",
+        "Bot klonini yaratish funksiyasi o'chirilgan.",
         reply_markup=kb.as_markup()
-    )
-
-
-@dp.callback_query(F.data == "admin_clone_price")
-async def cb_admin_clone_price(callback: CallbackQuery, state: FSMContext):
-    if is_clone_bot() or not is_panel_owner(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
-        return
-    await callback.message.edit_text(
-        "Klonning yangi narxini Telegram Stars'da yuboring (0 dan 100000 gacha butun son; 0 bepul):",
-        reply_markup=back_kb("admin_clone_settings")
-    )
-    await state.set_state(UserStatesGroup.admin_clone_price)
-
-
-@dp.message(StateFilter(UserStatesGroup.admin_clone_price), F.text)
-async def admin_clone_price_input(message: Message, state: FSMContext):
-    if is_clone_bot() or not is_panel_owner(message.from_user.id):
-        return
-    try:
-        price = int(message.text.strip())
-    except ValueError:
-        await message.answer("0 dan 100000 gacha butun Stars sonini kiriting.")
-        return
-    if not 0 <= price <= 100000:
-        await message.answer("Narx 0 dan 100000 Stars oralig'ida bo'lishi kerak.")
-        return
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute(
-            "INSERT INTO bot_settings (key, value) VALUES ('clone_price_stars', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (str(price),)
-        )
-        await db.commit()
-    await state.clear()
-    await message.answer(
-        f"Narx belgilandi: <b>{price} Stars</b>.",
-        reply_markup=get_admin_keyboard()
     )
 
 
@@ -4595,23 +4415,6 @@ async def admin_pro_price_input(message: Message, state: FSMContext):
         f"PRO narxi belgilandi: <b>{price} Stars</b>.",
         reply_markup=get_admin_keyboard(),
     )
-
-
-@dp.callback_query(F.data == "admin_clones_list")
-async def cb_admin_clones_list(callback: CallbackQuery):
-    if is_clone_bot() or not is_panel_owner(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
-        return
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute(
-            "SELECT username, owner_id, created_at FROM cloned_bots WHERE active = 1 ORDER BY created_at DESC LIMIT 50"
-        ) as cur:
-            rows = await cur.fetchall()
-    text = "📋 <b>Ulangan klonlar</b>\n\n" + (
-        "\n".join(f"@{html.escape(name)} | egasi <code>{owner}</code>" for name, owner, _ in rows)
-        if rows else "Hozircha faol klonlar yo'q."
-    )
-    await callback.message.edit_text(text, reply_markup=back_kb("admin_clone_settings"))
 
 
 @dp.callback_query(F.data == "admin_custom_emoji")
@@ -6447,7 +6250,7 @@ async def main():
         asyncio.create_task(health_server())
         await load_existing_sessions()
         register_common_keyboard_buttons()
-        await load_registered_clones()
+        # Clone bots are disabled.
         asyncio.create_task(pro_expiration_checker())
         asyncio.create_task(bio_watcher())
         await dp.start_polling(primary_bot, skip_updates=True)
