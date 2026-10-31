@@ -2994,11 +2994,10 @@ async def run_scrape_for_count(
         found: dict[int, tuple[str, str, str]] = {}
         expected_count = getattr(group, "participants_count", None) or 0
 
-        if getattr(group, "id", None):
+        if not isinstance(group, Chat) and getattr(group, "id", None):
             try:
                 offset = 0
                 while offset < 20000:
-                    found_before_page = len(found)
                     result = await client(GetParticipantsRequest(
                         channel=group,
                         filter=ChannelParticipantsSearch(""),
@@ -3025,32 +3024,46 @@ async def run_scrape_for_count(
                     if len(users) < 200:
                         break
                     offset += len(users)
-                    if len(found) == found_before_page:
-                        break
             except Exception as exc:
                 log.warning("Participants manual terish xatosi (%s): %s", uid, exc)
 
-        async for participant in client.iter_participants(group, limit=None):
-            if getattr(participant, "bot", False):
-                continue
-            participant_id = getattr(participant, "id", None)
-            if not participant_id or participant_id == me.id:
-                continue
-            participant_username = getattr(participant, "username", None)
-            if participant_username:
-                user_ref = f"@{participant_username}"
-            else:
-                user_ref = str(participant_id)
-            fullname = get_display_name(participant).strip()
-            found[int(participant_id)] = (user_ref, fullname, str(participant_id))
-            if len(found) % 100 == 0:
-                try:
-                    await status.edit_text(
-                        f"⏳ <b>{html.escape(group_title)}</b> guruhidan terilmoqda...\n\n"
-                        f"📥 Yig'ildi: <b>{len(found)}</b>"
-                    )
-                except Exception:
-                    pass
+        if isinstance(group, Chat):
+            participants = await client.get_participants(group, limit=None)
+            for participant in participants:
+                if getattr(participant, "bot", False):
+                    continue
+                participant_id = getattr(participant, "id", None)
+                if not participant_id or participant_id == me.id:
+                    continue
+                participant_username = getattr(participant, "username", None)
+                user_ref = f"@{participant_username}" if participant_username else str(participant_id)
+                found[int(participant_id)] = (
+                    user_ref,
+                    get_display_name(participant).strip(),
+                    str(participant_id),
+                )
+                if len(found) % 100 == 0:
+                    try:
+                        await status.edit_text(
+                            f"⏳ <b>{html.escape(group_title)}</b> guruhidan terilmoqda...\n\n"
+                            f"📥 Yig'ildi: <b>{len(found)}</b>"
+                        )
+                    except Exception:
+                        pass
+        else:
+            async for participant in client.iter_participants(group, limit=None):
+                if getattr(participant, "bot", False):
+                    continue
+                participant_id = getattr(participant, "id", None)
+                if not participant_id or participant_id == me.id:
+                    continue
+                participant_username = getattr(participant, "username", None)
+                user_ref = f"@{participant_username}" if participant_username else str(participant_id)
+                found[int(participant_id)] = (
+                    user_ref,
+                    get_display_name(participant).strip(),
+                    str(participant_id),
+                )
 
         if len(found) < max(100, expected_count or 0):
             try:
