@@ -37,11 +37,11 @@ from telethon.errors import (
 from telethon.tl.types import (
     UserStatusOnline, Chat, DocumentAttributeCustomEmoji, InputStickerSetShortName,
     MessageEntityCustomEmoji, MessageEntityMentionName,
-    ChannelParticipantsAdmins,
+    ChannelParticipantsAdmins, ChannelParticipantsRecent,
 )
 from telethon.utils import get_display_name, get_peer_id
 from telethon.tl.functions.messages import GetStickerSetRequest, AddChatUserRequest
-from telethon.tl.functions.channels import InviteToChannelRequest
+from telethon.tl.functions.channels import InviteToChannelRequest, GetParticipantsRequest
 from telethon.tl.functions.account import UpdateProfileRequest
 from telethon.tl.functions.users import GetFullUserRequest
 from urllib.parse import urlparse
@@ -2977,8 +2977,12 @@ async def run_scrape_for_count(
         return
 
     group = choice["entity"]
+    try:
+        group = await client.get_entity(group)
+    except Exception as exc:
+        log.warning("Guruh entity yangilanmadi (%s): %s", uid, exc)
     group_title = str(choice["title"])
-    mode_label = "tez" if mode == "fast" else "sekin"
+    mode_label = "avtomatik"
     status = await message.answer(
         f"⏳ <b>{html.escape(group_title)}</b> guruhidagi barcha mavjud a'zolar "
         f"{mode_label} rejimda yig'ilmoqda...\n\n"
@@ -3029,6 +3033,40 @@ async def run_scrape_for_count(
                     )
             except Exception as exc:
                 log.warning("Participants fallback xatosi (%s): %s", uid, exc)
+
+        expected_count = getattr(group, "participants_count", None) or 0
+        if len(found) < max(100, expected_count or 0) and getattr(group, "id", None):
+            try:
+                offset = 0
+                while offset < 20000:
+                    result = await client(GetParticipantsRequest(
+                        channel=group,
+                        filter=ChannelParticipantsRecent(),
+                        offset=offset,
+                        limit=200,
+                        hash=0,
+                    ))
+                    users = getattr(result, "users", [])
+                    if not users:
+                        break
+                    for participant in users:
+                        if getattr(participant, "bot", False):
+                            continue
+                        participant_id = getattr(participant, "id", None)
+                        if not participant_id or participant_id == me.id:
+                            continue
+                        participant_username = getattr(participant, "username", None)
+                        user_ref = f"@{participant_username}" if participant_username else str(participant_id)
+                        found[int(participant_id)] = (
+                            user_ref,
+                            get_display_name(participant).strip(),
+                            str(participant_id),
+                        )
+                    if len(users) < 200:
+                        break
+                    offset += len(users)
+            except Exception as exc:
+                log.warning("Participants manual fallback xatosi (%s): %s", uid, exc)
 
         try:
             await status.edit_text(
