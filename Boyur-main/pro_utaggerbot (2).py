@@ -37,7 +37,7 @@ from telethon.errors import (
 from telethon.tl.types import (
     UserStatusOnline, Chat, DocumentAttributeCustomEmoji, InputStickerSetShortName,
     MessageEntityCustomEmoji, MessageEntityMentionName,
-    ChannelParticipantsAdmins, ChannelParticipantsRecent,
+    ChannelParticipantsAdmins, ChannelParticipantsSearch,
 )
 from telethon.utils import get_display_name, get_peer_id
 from telethon.tl.functions.messages import GetStickerSetRequest, AddChatUserRequest
@@ -3041,7 +3041,7 @@ async def run_scrape_for_count(
                 while offset < 20000:
                     result = await client(GetParticipantsRequest(
                         channel=group,
-                        filter=ChannelParticipantsRecent(),
+                        filter=ChannelParticipantsSearch(""),
                         offset=offset,
                         limit=200,
                         hash=0,
