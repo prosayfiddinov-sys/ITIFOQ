@@ -31,14 +31,17 @@ from telethon.errors import (
     FloodWaitError, UserPrivacyRestrictedError, PeerFloodError,
     PremiumAccountRequiredError, EntityBoundsInvalidError,
     SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError,
-    PasswordHashInvalidError,
+    PasswordHashInvalidError, UserAlreadyParticipantError, UserIdInvalidError,
+    UsernameNotOccupiedError, InputUserDeactivatedError, ChannelPrivateError,
 )
 from telethon.tl.types import (
     UserStatusOnline, Chat, DocumentAttributeCustomEmoji, InputStickerSetShortName,
-    MessageEntityCustomEmoji, MessageEntityMentionName, ChannelParticipantsAdmins,
+    MessageEntityCustomEmoji, MessageEntityMention, MessageEntityMentionName,
+    ChannelParticipantsAdmins,
 )
 from telethon.utils import get_display_name, get_peer_id
-from telethon.tl.functions.messages import GetStickerSetRequest
+from telethon.tl.functions.messages import GetStickerSetRequest, AddChatUserRequest
+from telethon.tl.functions.channels import InviteToChannelRequest
 from telethon.tl.functions.account import UpdateProfileRequest
 from telethon.tl.functions.users import GetFullUserRequest
 from urllib.parse import urlparse
@@ -199,6 +202,11 @@ class UserStatesGroup(StatesGroup):
     admin_custom_emoji_pack = State()
     admin_give_pro         = State()
     admin_clone_price      = State()
+    member_add_package     = State()
+    member_add_group       = State()
+    member_add_admin       = State()
+    member_add_users       = State()
+    admin_member_add_price = State()
     clone_token_input      = State()
     ban_target_input       = State()
     contest_channel        = State()
@@ -331,6 +339,37 @@ async def init_db():
             fullname TEXT NOT NULL,
             last_seen TEXT NOT NULL,
             PRIMARY KEY (chat_id, user_id)
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS member_add_prices (
+            package_count INTEGER PRIMARY KEY,
+            price INTEGER NOT NULL DEFAULT 0
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS member_add_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            package_count INTEGER NOT NULL,
+            target_chat TEXT NOT NULL,
+            invite_profile TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'waiting_list',
+            added_count INTEGER NOT NULL DEFAULT 0,
+            failed_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS member_add_daily_usage (
+            owner_id TEXT NOT NULL,
+            usage_date TEXT NOT NULL,
+            added_count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (owner_id, usage_date)
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS member_add_users (
+            order_id INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            username TEXT NOT NULL,
+            PRIMARY KEY (order_id, position)
         )""")
         try:
             await db.execute(
@@ -568,12 +607,45 @@ def is_pro_user(pro_until_str: str | None) -> bool:
 def make_text_unique(text: str) -> str:
     if not text:
         return ""
-    invisible = ["\u200c", "\u200d", "\u200b"]
-    return f"{text}{''.join(random.choices(invisible, k=3))}"
+    return text
 
 
 def utf16_length(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
+
+
+def get_user_mention_name(user) -> str:
+    username = str(getattr(user, "username", "") or "").strip().lstrip("@")
+    if username:
+        return f"@{username}"
+
+    display_name = get_display_name(user).strip()
+    if display_name:
+        return display_name.replace("#", "").strip()
+
+    return (
+        " ".join(filter(None, (
+            getattr(user, "first_name", None),
+            getattr(user, "last_name", None),
+        ))).strip() or "A'zo"
+    )
+
+
+def get_user_mention_entities(
+    user,
+    mention: str,
+) -> list[MessageEntityMentionName | MessageEntityMention]:
+    username = str(getattr(user, "username", "") or "").strip().lstrip("@")
+    if username:
+        return [MessageEntityMention(
+            offset=0,
+            length=utf16_length(mention),
+        )]
+    return [MessageEntityMentionName(
+        offset=0,
+        length=utf16_length(mention),
+        user_id=user.id,
+    )]
 
 
 # Random uTag uchun 50 tadan ko'p kulgili so'zlar.
@@ -657,36 +729,27 @@ def make_random_utag_text(
     user,
     custom_emoji: tuple[int, str] | None = None,
     random_words: list[str] | None = None,
-) -> tuple[str, list[MessageEntityCustomEmoji | MessageEntityMentionName]]:
+) -> tuple[str, list[MessageEntityMention | MessageEntityMentionName]]:
     """Username va guruh/bot so'zlari bilan random uTag."""
-    username = getattr(user, "username", None)
-    if username:
-        mention = f"@{username}"
-    else:
-        mention = get_display_name(user).replace("#", "").strip() or "do'stimiz"
+    mention = get_user_mention_name(user)
     word = random.choice(random_words or RANDOM_UTAG_WORDS)
-    emoji_text = custom_emoji[1] if custom_emoji else ""
-    text = f"{mention}, {word}{emoji_text}"
-    entities: list[MessageEntityCustomEmoji | MessageEntityMentionName] = []
-    if not username:
-        entities.append(MessageEntityMentionName(
-            offset=0,
-            length=utf16_length(mention),
-            user_id=user.id,
-        ))
-    if custom_emoji:
-        entities.append(MessageEntityCustomEmoji(
-            offset=utf16_length(text) - utf16_length(emoji_text),
-            length=utf16_length(emoji_text),
-            document_id=custom_emoji[0],
-        ))
+    text = f"{mention}, {word}"
+    entities: list[MessageEntityMention | MessageEntityMentionName] = []
+    entities.extend(get_user_mention_entities(user, mention))
     return text, entities
 
 
 def make_bot_random_tag(user_id: str, username: str | None, fullname: str, word: str) -> str:
-    mention = f"@{username}" if username else (
-        f'<a href="tg://user?id={user_id}">{html.escape(fullname)}</a>'
-    )
+    clean_username = str(username or "").strip().lstrip("@")
+    if clean_username:
+        display_name = f"@{clean_username}"
+        profile_url = f"https://t.me/{html.escape(clean_username)}"
+    else:
+        display_name = fullname.strip() if fullname.strip() else "A'zo"
+        profile_url = f"tg://user?id={html.escape(str(user_id))}"
+
+    display_name = html.escape(display_name)
+    mention = f'<a href="{profile_url}">{display_name}</a>'
     return f"{mention}, {html.escape(word)}"
 
 
@@ -710,22 +773,11 @@ async def run_bot_utag(chat_id: int, random_mode: bool):
             if word not in {"uchun", "bilan", "ham", "bir", "bu", "va"}
         ][:40]
         words = list(dict.fromkeys(words + popular))
-    custom_emojis = []
-    if random_mode:
-        if not _custom_emoji_pack_cache:
-            owner_client = userbot_clients.get(str(ADMIN_ID))
-            if owner_client:
-                await get_custom_emoji_pack(owner_client)
-        custom_emojis = _custom_emoji_pack_cache
-
     try:
         for user_id, username, fullname in reversed(members):
             word = random.choice(words) if random_mode else ""
             text = make_bot_random_tag(user_id, username, fullname, word)
-            if random_mode and custom_emojis:
-                emoji_id, _ = random.choice(custom_emojis)
-                text += f'<tg-emoji emoji-id="{emoji_id}">x</tg-emoji>'
-            await bot.send_message(chat_id, text)
+            await bot.send_message(chat_id, text, parse_mode="HTML")
             await asyncio.sleep(0.7)
     except asyncio.CancelledError:
         raise
@@ -735,7 +787,7 @@ async def run_bot_utag(chat_id: int, random_mode: bool):
 
 @dp.message(F.chat.type.in_({"group", "supergroup"}))
 async def bot_group_utag_handler(message: Message):
-    if not message.from_user or message.from_user.is_bot:
+    if not message.from_user:
         return
     chat_id = int(message.chat.id)
     username = message.from_user.username
@@ -910,6 +962,7 @@ def get_main_keyboard(
         InlineKeyboardButton(text="💠 User Yig'ish", callback_data="btn_scrape"),
         InlineKeyboardButton(text="🆓 Bepul rejim", callback_data="btn_pro_info")
     )
+    kb.row(InlineKeyboardButton(text="👥 Guruhga a'zo qo'shish", callback_data="member_add"))
     kb.row(
         InlineKeyboardButton(text="👤 Profil", callback_data="profile"),
         InlineKeyboardButton(text="📱 Akauntlar", callback_data="btn_userbot")
@@ -2222,12 +2275,14 @@ async def do_utag(client: TelegramClient, uid: str, event, random_mode: bool = F
         participants = await client.get_participants(chat, limit=500)
         me = await client.get_me()
         delay = await get_utag_delay(uid)
-        custom_emojis = await get_custom_emoji_pack(client) if random_mode else []
         random_words = await get_group_random_words(client, chat) if random_mode else None
         tagged = 0
         seen_user_ids: set[int] = set()
 
-        async def send_member_tag(text: str, entities: list[MessageEntityCustomEmoji | MessageEntityMentionName]):
+        async def send_member_tag(
+            text: str,
+            entities: list[MessageEntityCustomEmoji | MessageEntityMention | MessageEntityMentionName],
+        ):
             nonlocal tagged
             while True:
                 try:
@@ -2244,7 +2299,7 @@ async def do_utag(client: TelegramClient, uid: str, event, random_mode: bool = F
                 except (PremiumAccountRequiredError, EntityBoundsInvalidError):
                     mention_entities = [
                         entity for entity in entities
-                        if isinstance(entity, MessageEntityMentionName)
+                        if isinstance(entity, (MessageEntityMention, MessageEntityMentionName))
                     ]
                     while True:
                         try:
@@ -2271,21 +2326,13 @@ async def do_utag(client: TelegramClient, uid: str, event, random_mode: bool = F
             seen_user_ids.add(user_id)
             try:
                 if random_mode:
-                    custom_emoji = random.choice(custom_emojis) if custom_emojis else None
                     tag_text, entities = make_random_utag_text(
-                        user, custom_emoji, random_words
+                        user, random_words=random_words
                     )
                 else:
-                    username = getattr(user, "username", None)
-                    mention = f"@{username}" if username else (
-                        get_display_name(user).replace("#", "").strip() or "do'stimiz"
-                    )
+                    mention = get_user_mention_name(user)
                     tag_text = make_text_unique(mention)
-                    entities = [] if username else [MessageEntityMentionName(
-                        offset=0,
-                        length=utf16_length(mention),
-                        user_id=user.id,
-                    )]
+                    entities = get_user_mention_entities(user, mention)
                 await send_member_tag(tag_text, entities)
             except FloodWaitError as e:
                 await asyncio.sleep(e.seconds + 5)
@@ -2857,19 +2904,15 @@ async def cb_scrape_mode(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id <= 0 or callback.message is None:
         await callback.answer("❌ So'rovni bajarib bo'lmadi.", show_alert=True)
         return
+    uid = str(callback.from_user.id)
     mode = callback.data.split(":", 1)[1]
     if mode not in {"fast", "slow"}:
         await callback.answer("❌ Noto'g'ri rejim.", show_alert=True)
         return
     await state.update_data(scrape_mode=mode)
-    await state.set_state(UserStatesGroup.scrape_count)
     mode_label = "Tez" if mode == "fast" else "Sekin"
-    await callback.message.edit_text(
-        f"⚙️ Rejim: <b>{mode_label} terish</b>\n\n"
-        "Nechta foydalanuvchi yig'ish kerak? 100, 200, 500, 1000 yoki 1500 ni tanlang:",
-        reply_markup=get_scrape_count_keyboard()
-    )
-    await callback.answer()
+    await callback.answer(f"{mode_label} terish boshlandi")
+    await run_scrape_for_count(callback.message, state, uid, 0, mode)
 
 
 async def run_scrape_for_count(
@@ -2888,27 +2931,27 @@ async def run_scrape_for_count(
     message_limit = 1000 if mode == "fast" else None
     mode_label = "tez" if mode == "fast" else "sekin"
     await message.answer(
-        f"⏳ <b>{html.escape(group_title)}</b> guruhidagi xabarlar {mode_label} rejimda tahlil qilinmoqda..."
+        f"⏳ <b>{html.escape(group_title)}</b> guruhidagi barcha mavjud a'zolar "
+        f"{mode_label} rejimda to'liq yig'ilmoqda..."
     )
 
     try:
         me = await client.get_me()
         found: dict[int, tuple[str, str, str]] = {}
-        async for item in client.iter_messages(group, limit=message_limit):
-            sender = await item.get_sender()
-            if not sender or getattr(sender, "bot", False):
+        participants = await client.get_participants(group, limit=None)
+        for participant in participants:
+            if getattr(participant, "bot", False):
                 continue
-            sender_id = getattr(sender, "id", None)
-            if not sender_id or sender_id == me.id or sender_id in found:
+            participant_id = getattr(participant, "id", None)
+            if not participant_id or participant_id == me.id:
                 continue
-            sender_username = getattr(sender, "username", None)
-            if not sender_username:
-                continue
-            username = f"@{sender_username}"
-            fullname = get_display_name(sender).strip()
-            found[int(sender_id)] = (username, fullname, str(sender_id))
-            if len(found) >= count:
-                break
+            participant_username = getattr(participant, "username", None)
+            if participant_username:
+                user_ref = f"@{participant_username}"
+            else:
+                user_ref = str(participant_id)
+            fullname = get_display_name(participant).strip()
+            found[int(participant_id)] = (user_ref, fullname, str(participant_id))
 
         scraped_at = datetime.now(timezone.utc).isoformat()
         async with aiosqlite.connect(DB_FILE) as db:
@@ -2941,20 +2984,20 @@ async def run_scrape_for_count(
         if found:
             batch: list[str] = []
             batch_chars = 0
-            for username, _, _ in found.values():
-                extra_chars = len(username) + (1 if batch else 0)
-                if batch and (len(batch) >= 150 or batch_chars + extra_chars > 3900):
+            for username, fullname, telegram_id in found.values():
+                display = username if username.startswith("@") else f"{fullname or 'A\'zo'} — {telegram_id}"
+                extra_chars = len(display) + (1 if batch else 0)
+                if batch and (batch_chars + extra_chars > 3900):
                     await bot.send_message(chat_id=int(uid), text="\n".join(batch))
                     batch = []
                     batch_chars = 0
-                    extra_chars = len(username)
-                batch.append(username)
-                batch_chars += extra_chars
+                batch.append(display)
+                batch_chars += len(display) + (1 if batch_chars else 0)
             if batch:
                 await bot.send_message(chat_id=int(uid), text="\n".join(batch))
         else:
             await bot.send_message(
-                chat_id=int(uid), text="Username’li foydalanuvchi topilmadi."
+                chat_id=int(uid), text="Guruhda foydalanuvchi topilmadi."
             )
     except Exception as exc:
         log.error(f"User yig'ishda xato ({uid}): {exc}")
@@ -3009,6 +3052,332 @@ async def scrape_count_input(message: Message, state: FSMContext):
     await run_scrape_for_count(message, state, str(message.from_user.id), count, mode)
 
 # ─────────────────────────────────────────────
+# MEMBER ADD / GROUP INVITE
+# ─────────────────────────────────────────────
+MEMBER_ADD_PACKAGES = (500, 1000, 2000, 3000, 4000, 5000)
+MEMBER_ADD_DAILY_LIMIT = 50
+_member_add_pending: dict[int, dict] = {}
+_member_add_tasks: dict[int, asyncio.Task] = {}
+
+
+def parse_member_add_users(text: str) -> list[str]:
+    raw_values = re.findall(r"(?:@?[A-Za-z][A-Za-z0-9_]{4,31}|\d{5,20}|t\.me/[A-Za-z0-9_]+)", text or "", flags=re.IGNORECASE)
+    values: list[str] = []
+    seen: set[str] = set()
+    for value in raw_values:
+        value = value.strip().lower()
+        value = value.removeprefix("https://").removeprefix("http://")
+        value = value.removeprefix("www.").removeprefix("t.me/")
+        normalized = f"@{value}" if value.isalpha() or "_" in value else value
+        if normalized.lower() not in seen:
+            seen.add(normalized.lower())
+            values.append(normalized)
+    return values
+
+
+def get_member_add_packages_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for count in MEMBER_ADD_PACKAGES:
+        kb.row(InlineKeyboardButton(
+            text=f"👥 {count:,} azo",
+            callback_data=f"member_add_package:{count}",
+        ))
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="start"))
+    return kb.as_markup()
+
+
+async def get_member_add_prices() -> dict[int, int]:
+    async with aiosqlite.connect(DB_FILE) as db:
+        rows = await db.execute_fetchall(
+            "SELECT package_count, price FROM member_add_prices"
+        )
+    defaults = {count: 0 for count in MEMBER_ADD_PACKAGES}
+    defaults.update({int(row[0]): int(row[1]) for row in rows})
+    return defaults
+
+
+async def run_member_add_order(order_id: int):
+    async with aiosqlite.connect(DB_FILE) as db:
+        row = await db.execute_fetchall(
+            "SELECT user_id, package_count, target_chat, invite_profile, status "
+            "FROM member_add_orders WHERE id = ?", (order_id,)
+        )
+        if not row:
+            return
+        user_id, package_count, target_chat, profile_id, status = row[0]
+        db_users = await db.execute_fetchall(
+            "SELECT username FROM member_add_users WHERE order_id = ?", (order_id,)
+        )
+    users = [row[0] for row in db_users]
+    client = userbot_clients.get(str(profile_id))
+    if not client:
+        await bot.send_message(int(user_id), "❌ Tanlangan profil hozir ulangan emas.")
+        return
+
+    if not client.is_connected():
+        await client.connect()
+    try:
+        target = await client.get_entity(target_chat)
+    except Exception as exc:
+        await bot.send_message(int(user_id), f"❌ Guruh topilmadi: {exc}")
+        return
+
+    added = 0
+    failed = 0
+    today = datetime.now(timezone.utc).date().isoformat()
+    for user_ref in users[:package_count]:
+        async with aiosqlite.connect(DB_FILE) as db:
+            daily = await db.execute_fetchall(
+                "SELECT added_count FROM member_add_daily_usage "
+                "WHERE owner_id = ? AND usage_date = ?", (profile_id, today)
+            )
+            used = int(daily[0][0]) if daily else 0
+        if used >= MEMBER_ADD_DAILY_LIMIT:
+            break
+        try:
+            user = await client.get_input_entity(user_ref)
+            if getattr(target, "broadcast", False) or getattr(target, "megagroup", False):
+                await client(InviteToChannelRequest(target, [user]))
+            else:
+                await client(AddChatUserRequest(chat_id=target.id, user_id=user, fwd_limit=0))
+            added += 1
+            async with aiosqlite.connect(DB_FILE) as db:
+                await db.execute(
+                    "INSERT INTO member_add_daily_usage (owner_id, usage_date, added_count) "
+                    "VALUES (?, ?, 1) ON CONFLICT(owner_id, usage_date) "
+                    "DO UPDATE SET added_count = added_count + 1", (profile_id, today)
+                )
+                await db.commit()
+        except (UserAlreadyParticipantError,):
+            # User guruhda bor; buni xato deb sanamasdan keyingi userga o'tamiz.
+            continue
+        except (UserPrivacyRestrictedError, UserIdInvalidError, UsernameNotOccupiedError,
+                InputUserDeactivatedError, ChannelPrivateError) as exc:
+            failed += 1
+            log.warning("Member-add xatosi %s: %s", user_ref, type(exc).__name__)
+        except PeerFloodError as exc:
+            failed += 1
+            await asyncio.sleep(getattr(exc, "seconds", 60) + 1)
+        except FloodWaitError as exc:
+            failed += 1
+            await asyncio.sleep(exc.seconds + 1)
+        except Exception as exc:
+            failed += 1
+            log.warning("Member-add xatosi %s: %s", user_ref, exc)
+        await asyncio.sleep(3)
+
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "UPDATE member_add_orders SET status = ?, added_count = ?, failed_count = ? WHERE id = ?",
+            ("completed" if added else "failed", added, failed, order_id)
+        )
+        await db.commit()
+    await bot.send_message(
+        int(user_id),
+        f"✅ <b>A'zo qo'shish yakunlandi</b>\n"
+        f"Qo'shildi: <b>{added}</b>\nO'tkazib yuborildi/xato: <b>{failed}</b>\n"
+        f"Kunlik limit: <b>{MEMBER_ADD_DAILY_LIMIT}</b>",
+    )
+
+
+def get_admin_member_add_keyboard(prices: dict[int, int]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for count in MEMBER_ADD_PACKAGES:
+        kb.row(InlineKeyboardButton(
+            text=f"{count:,} azo - {prices[count]}",
+            callback_data=f"admin_member_price:{count}",
+        ))
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin_panel"))
+    return kb.as_markup()
+
+
+@dp.callback_query(F.data == "admin_member_add")
+async def cb_admin_member_add(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Faqat owner uchun", show_alert=True)
+        return
+    prices = await get_member_add_prices()
+    await callback.message.edit_text(
+        "👥 <b>A'zo qo'shish paketlari</b>\n"
+        f"Kunlik limit: <b>{MEMBER_ADD_DAILY_LIMIT} ta</b>\nPaket narxini o'zgartirish uchun boshing:",
+        reply_markup=get_admin_member_add_keyboard(prices),
+    )
+
+
+@dp.callback_query(F.data.startswith("admin_member_price:"))
+async def cb_admin_member_price(callback: CallbackQuery, state: FSMContext):
+    count = int(callback.data.split(":", 1)[1])
+    await state.update_data(member_add_count=count)
+    await state.set_state(UserStatesGroup.admin_member_add_price)
+    await callback.message.edit_text(
+        f"{count:,} azo paketi narxini raqamda yuboring:",
+        reply_markup=back_kb("admin_member_add"),
+    )
+
+
+@dp.message(StateFilter(UserStatesGroup.admin_member_add_price), F.text)
+async def admin_member_add_price_input(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        price = int(message.text.replace(" ", ""))
+        if price < 0:
+            raise ValueError
+        data = await state.get_data()
+        count = int(data["member_add_count"])
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute(
+                "INSERT INTO member_add_prices(package_count, price) VALUES (?, ?) "
+                "ON CONFLICT(package_count) DO UPDATE SET price = excluded.price",
+                (count, price),
+            )
+            await db.commit()
+        await state.clear()
+        await message.answer(f"✅ {count:,} azo paketi narxi {price} ga saqlandi.")
+        prices = await get_member_add_prices()
+        await message.answer("👥 Paketlar:", reply_markup=get_admin_member_add_keyboard(prices))
+    except ValueError:
+        await message.answer("Faqat 0 yoki musbat butun son kiriting.")
+
+
+@dp.callback_query(F.data == "member_add")
+async def cb_member_add_start(callback: CallbackQuery):
+    prices = await get_member_add_prices()
+    lines = ["👥 <b>Guruhga a'zo qo'shish</b>", f"Kunlik limit: <b>{MEMBER_ADD_DAILY_LIMIT} ta</b>"]
+    for count in MEMBER_ADD_PACKAGES:
+        lines.append(f"• {count:,} azo - <b>{prices[count]}</b>")
+    await callback.message.edit_text("\n".join(lines), reply_markup=get_member_add_packages_keyboard())
+
+
+@dp.callback_query(F.data.startswith("member_add_package:"))
+async def cb_member_add_package(callback: CallbackQuery, state: FSMContext):
+    count = int(callback.data.split(":", 1)[1])
+    _member_add_pending[callback.from_user.id] = {"package_count": count}
+    await state.set_state(UserStatesGroup.member_add_group)
+    await callback.message.edit_text(
+        f"👥 <b>{count:,} azo</b> paketi tanlandi.\n\nA'zolar qo'shiladigan guruh linkini yuboring:"
+    )
+
+
+@dp.message(StateFilter(UserStatesGroup.member_add_group), F.text)
+async def member_add_group_input(message: Message, state: FSMContext):
+    group = message.text.strip()
+    pending = _member_add_pending.setdefault(message.from_user.id, {})
+    pending["target_chat"] = group
+    await state.set_state(UserStatesGroup.member_add_admin)
+    await message.answer(
+        "A'zolarni qo'shuvchi profil admin userini yuboring:\n"
+        "- Telegram user ID\n- @username\n- /admin orqali ulangan profile"
+    )
+
+
+@dp.message(StateFilter(UserStatesGroup.member_add_admin), F.text)
+async def member_add_admin_input(message: Message, state: FSMContext):
+    profile = message.text.strip().lstrip("@")
+    matched_id = None
+    for uid, client in userbot_clients.items():
+        try:
+            me = await client.get_me()
+            if profile == str(uid) or profile.lower() == str(getattr(me, "username", "") or "").lower():
+                matched_id = uid
+                break
+        except Exception:
+            continue
+    if not matched_id:
+        await message.answer("❌ Bu profil userboti ulanmagan yoki ID/username topilmadi. Avval profilni ulang.")
+        return
+    pending = _member_add_pending.setdefault(message.from_user.id, {})
+    pending["invite_profile"] = matched_id
+    await state.set_state(UserStatesGroup.member_add_users)
+    await message.answer(
+        "Userlar ro'yxatini yuboring, reply qiling yoki .txt fayl tashlang:\n"
+        "Har bir user: @username, user ID yoki t.me havola bo'lishi mumkin."
+    )
+
+
+async def extract_member_add_users(message: Message) -> list[str]:
+    source = message.reply_to_message or message
+    texts: list[str] = []
+    if source.text:
+        texts.append(source.text)
+    document = source.document
+    if document:
+        from io import BytesIO
+        output = BytesIO()
+        await bot.download(document, destination=output)
+        output.seek(0)
+        try:
+            texts.append(output.read().decode("utf-8"))
+        except UnicodeDecodeError:
+            texts.append(output.read().decode("utf-8", errors="ignore"))
+    return parse_member_add_users("\n".join(texts))
+
+
+@dp.message(StateFilter(UserStatesGroup.member_add_users))
+async def member_add_users_input(message: Message, state: FSMContext):
+    users = await extract_member_add_users(message)
+    pending = _member_add_pending.get(message.from_user.id, {})
+    if not users:
+        await message.answer("❌ User topilmadi. @username, ID yoki t.me havola yuboring.")
+        return
+    package_count = int(pending["package_count"])
+    today = datetime.now(timezone.utc).date().isoformat()
+    profile_id = str(pending["invite_profile"])
+    async with aiosqlite.connect(DB_FILE) as db:
+        daily = await db.execute_fetchall(
+            "SELECT added_count FROM member_add_daily_usage WHERE owner_id = ? AND usage_date = ?",
+            (profile_id, today),
+        )
+        used = int(daily[0][0]) if daily else 0
+        if used >= MEMBER_ADD_DAILY_LIMIT:
+            await message.answer("❌ Bu profilning bugungi kunlik 50 ta qo'shish limiti tugagan.")
+            return
+        cursor = await db.execute(
+            "INSERT INTO member_add_orders "
+            "(user_id, package_count, target_chat, invite_profile, status, created_at) "
+            "VALUES (?, ?, ?, ?, 'queued', ?)",
+            (str(message.from_user.id), package_count, pending["target_chat"], profile_id,
+             datetime.now(timezone.utc).isoformat()),
+        )
+        order_id = cursor.lastrowid
+        await db.executemany(
+            "INSERT INTO member_add_users(order_id, position, username) VALUES (?, ?, ?)",
+            [(order_id, position, username) for position, username in enumerate(users[:package_count], 1)],
+        )
+        await db.commit()
+    await state.clear()
+    _member_add_pending.pop(message.from_user.id, None)
+    stop_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="⏹ A'zo qo'shishni to'xtatish", callback_data="member_add_stop")
+    ]])
+    await message.answer(
+        f"✅ Buyurtma yaratildi.\nUserlar: <b>{min(len(users), package_count)}</b> ta\n"
+        "A'zo qo'shish boshlandi.",
+        reply_markup=stop_keyboard,
+    )
+    task = asyncio.create_task(run_member_add_order(order_id))
+    _member_add_tasks[message.from_user.id] = task
+
+
+@dp.callback_query(F.data == "member_add_stop")
+async def cb_member_add_stop(callback: CallbackQuery):
+    task = _member_add_tasks.get(callback.from_user.id)
+    if not task or task.done():
+        await callback.answer("Faol a'zo qo'shish jarayoni yo'q.", show_alert=True)
+        return
+    task.cancel()
+    _member_add_tasks.pop(callback.from_user.id, None)
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "UPDATE member_add_orders SET status = 'stopped' "
+            "WHERE user_id = ? AND status IN ('queued', 'waiting_list') ORDER BY id DESC LIMIT 1",
+            (str(callback.from_user.id),),
+        )
+        await db.commit()
+    await callback.answer("A'zo qo'shish to'xtatildi.", show_alert=True)
+
+
+# ─────────────────────────────────────────────
 # ADMIN PANEL
 # ─────────────────────────────────────────────
 def get_admin_keyboard() -> InlineKeyboardMarkup:
@@ -3021,7 +3390,8 @@ def get_admin_keyboard() -> InlineKeyboardMarkup:
     kb.row(InlineKeyboardButton(text="🎉 Konkurs yaratish", callback_data="admin_contest_create"))
     kb.row(InlineKeyboardButton(text="🏆 Aktiv konkurslar", callback_data="admin_contests_list"))
     kb.row(InlineKeyboardButton(text="📣 Xabar tarqatish", callback_data="admin_broadcast"))
-    kb.row(InlineKeyboardButton(text="😀 Custom emoji pack", callback_data="admin_custom_emoji"))
+    kb.row(InlineKeyboardButton(text="� A'zo qo'shish paketlari", callback_data="admin_member_add"))
+    kb.row(InlineKeyboardButton(text="�😀 Custom emoji pack", callback_data="admin_custom_emoji"))
     if not is_clone_bot():
         kb.row(InlineKeyboardButton(text="🚫 Ban panel", callback_data="ban_panel"))
         kb.row(InlineKeyboardButton(text="🛡 Raid guruhlarini tanlash", callback_data="admin_raid_groups"))
