@@ -2919,11 +2919,10 @@ async def scrape_group_link_input(message: Message, state: FSMContext):
             "title": title,
         }
         await state.update_data(scrape_group_key=key)
-        await state.set_state(UserStatesGroup.scrape_mode)
         await message.answer(
-            f"✅ Tanlandi: <b>{html.escape(title)}</b>\n\nTerish usulini tanlang:",
-            reply_markup=get_scrape_mode_keyboard(),
+            f"✅ Tanlandi: <b>{html.escape(title)}</b>\n\nTerish boshlandi..."
         )
+        await run_scrape_for_count(message, state, uid, None, "fast")
     except Exception as exc:
         log.warning("Scrape group havolasi topilmadi (%s): %s", uid, exc)
         await message.answer("❌ Guruh topilmadi yoki akkaunt guruhga a'zo emas.")
@@ -2940,10 +2939,10 @@ async def cb_scrape_group_selected(callback: CallbackQuery, state: FSMContext):
     await state.update_data(scrape_group_key=key)
     await callback.message.edit_text(
         f"✅ Tanlandi: <b>{html.escape(str(choice['title']))}</b>\n\n"
-        "Terish usulini tanlang:",
-        reply_markup=get_scrape_mode_keyboard()
+        "Guruhdagi barcha a'zolar terilmoqda..."
     )
-    await state.set_state(UserStatesGroup.scrape_mode)
+    await callback.answer()
+    await run_scrape_for_count(callback.message, state, uid, None, "fast")
 
 
 @dp.callback_query(F.data.startswith("scrape_mode:"))
@@ -2967,7 +2966,7 @@ async def cb_scrape_mode(callback: CallbackQuery, state: FSMContext):
 
 
 async def run_scrape_for_count(
-    message: Message, state: FSMContext, uid: str, count: int, mode: str
+    message: Message, state: FSMContext, uid: str, count: int | None, mode: str
 ):
     client = userbot_clients.get(uid)
     data = await state.get_data()
@@ -2983,14 +2982,13 @@ async def run_scrape_for_count(
     status = await message.answer(
         f"⏳ <b>{html.escape(group_title)}</b> guruhidagi barcha mavjud a'zolar "
         f"{mode_label} rejimda yig'ilmoqda...\n\n"
-        f"📥 Yig'ildi: <b>0/{count or 'jami'}</b>"
+        "📥 Yig'ildi: <b>0</b>"
     )
 
     try:
         me = await client.get_me()
         found: dict[int, tuple[str, str, str]] = {}
-        participant_limit = min(count, 20000) if count else 20000
-        async for participant in client.iter_participants(group, limit=participant_limit):
+        async for participant in client.iter_participants(group, limit=None):
             if getattr(participant, "bot", False):
                 continue
             participant_id = getattr(participant, "id", None)
@@ -3007,14 +3005,15 @@ async def run_scrape_for_count(
                 try:
                     await status.edit_text(
                         f"⏳ <b>{html.escape(group_title)}</b> guruhidan terilmoqda...\n\n"
-                        f"📥 Yig'ildi: <b>{len(found)}/{participant_limit}</b>"
+                        f"📥 Yig'ildi: <b>{len(found)}</b>"
                     )
                 except Exception:
                     pass
 
-        if len(found) < participant_limit:
+        expected_count = getattr(group, "participants_count", None) or 0
+        if len(found) < max(100, expected_count or 0):
             try:
-                participants = await client.get_participants(group, limit=participant_limit)
+                participants = await client.get_participants(group, limit=None)
                 for participant in participants:
                     if getattr(participant, "bot", False):
                         continue
