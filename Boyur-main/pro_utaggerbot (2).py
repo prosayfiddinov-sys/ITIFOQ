@@ -194,6 +194,7 @@ class UserStatesGroup(StatesGroup):
     scrape_group_select = State()
     scrape_mode        = State()
     scrape_count       = State()
+    scrape_group_link  = State()
     admin_broadcast        = State()
     admin_add_channel      = State()
     admin_raid_add_group   = State()
@@ -2806,6 +2807,10 @@ def get_scrape_groups_keyboard(uid: str) -> InlineKeyboardMarkup:
             text=f"👥 {title[:42]}",
             callback_data=f"scrape_group:{key}"
         ))
+    kb.row(InlineKeyboardButton(
+        text="🔗 Guruh havolasini yuborish",
+        callback_data="scrape_group_link",
+    ))
     kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="main_menu"))
     return kb.as_markup()
 
@@ -2814,10 +2819,11 @@ def get_scrape_count_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     buttons = [
         InlineKeyboardButton(text=f"👥 {count}", callback_data=f"scrape_count:{count}")
-        for count in (100, 200, 500, 1000, 1500)
+        for count in (100, 200, 500, 1000, 1500, 5000, 10000, 20000)
     ]
     kb.row(*buttons[:3])
-    kb.row(*buttons[3:])
+    kb.row(*buttons[3:6])
+    kb.row(*buttons[6:])
     kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="btn_scrape"))
     return kb.as_markup()
 
@@ -2878,6 +2884,51 @@ async def cb_scrape_menu(callback: CallbackQuery, state: FSMContext):
     )
 
 
+@dp.callback_query(F.data == "scrape_group_link")
+async def cb_scrape_group_link(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "🔗 Guruh havolasini yoki public username ni yuboring:\n\n"
+        "<code>https://t.me/guruh</code>\n"
+        "<code>@guruh</code>",
+    )
+    await state.set_state(UserStatesGroup.scrape_group_link)
+    await callback.answer()
+
+
+@dp.message(StateFilter(UserStatesGroup.scrape_group_link), F.text)
+async def scrape_group_link_input(message: Message, state: FSMContext):
+    uid = str(message.from_user.id)
+    client = userbot_clients.get(uid)
+    if not client:
+        await message.answer("❌ Avval akkaunt ulang.")
+        return
+
+    raw_link = message.text.strip()
+    try:
+        entity = await client.get_entity(raw_link)
+        if not (
+            isinstance(entity, Chat)
+            or getattr(entity, "megagroup", False)
+        ):
+            await message.answer("❌ Bu guruh yoki superguruh havolasi emas.")
+            return
+        title = get_display_name(entity).strip() or raw_link
+        key = f"link_{len(_scrape_group_choices.setdefault(uid, {}))}"
+        _scrape_group_choices.setdefault(uid, {})[key] = {
+            "entity": entity,
+            "title": title,
+        }
+        await state.update_data(scrape_group_key=key)
+        await state.set_state(UserStatesGroup.scrape_mode)
+        await message.answer(
+            f"✅ Tanlandi: <b>{html.escape(title)}</b>\n\nTerish usulini tanlang:",
+            reply_markup=get_scrape_mode_keyboard(),
+        )
+    except Exception as exc:
+        log.warning("Scrape group havolasi topilmadi (%s): %s", uid, exc)
+        await message.answer("❌ Guruh topilmadi yoki akkaunt guruhga a'zo emas.")
+
+
 @dp.callback_query(F.data.startswith("scrape_group:"))
 async def cb_scrape_group_selected(callback: CallbackQuery, state: FSMContext):
     uid = str(callback.from_user.id)
@@ -2908,7 +2959,11 @@ async def cb_scrape_mode(callback: CallbackQuery, state: FSMContext):
     await state.update_data(scrape_mode=mode)
     mode_label = "Tez" if mode == "fast" else "Sekin"
     await callback.answer(f"{mode_label} terish boshlandi")
-    await run_scrape_for_count(callback.message, state, uid, 0, mode)
+    await state.set_state(UserStatesGroup.scrape_count)
+    await callback.message.edit_text(
+        f"📊 <b>{mode_label} terish</b>\n\nNechta obunachi yig'ilsin?",
+        reply_markup=get_scrape_count_keyboard(),
+    )
 
 
 async def run_scrape_for_count(
@@ -2924,18 +2979,18 @@ async def run_scrape_for_count(
 
     group = choice["entity"]
     group_title = str(choice["title"])
-    message_limit = 1000 if mode == "fast" else None
     mode_label = "tez" if mode == "fast" else "sekin"
-    await message.answer(
+    status = await message.answer(
         f"⏳ <b>{html.escape(group_title)}</b> guruhidagi barcha mavjud a'zolar "
-        f"{mode_label} rejimda to'liq yig'ilmoqda..."
+        f"{mode_label} rejimda yig'ilmoqda...\n\n"
+        f"📥 Yig'ildi: <b>0/{count or 'jami'}</b>"
     )
 
     try:
         me = await client.get_me()
         found: dict[int, tuple[str, str, str]] = {}
-        participants = await client.get_participants(group, limit=None)
-        for participant in participants:
+        participant_limit = min(count, 20000) if count else 20000
+        async for participant in client.iter_participants(group, limit=participant_limit):
             if getattr(participant, "bot", False):
                 continue
             participant_id = getattr(participant, "id", None)
@@ -2948,6 +3003,22 @@ async def run_scrape_for_count(
                 user_ref = str(participant_id)
             fullname = get_display_name(participant).strip()
             found[int(participant_id)] = (user_ref, fullname, str(participant_id))
+            if len(found) % 100 == 0:
+                try:
+                    await status.edit_text(
+                        f"⏳ <b>{html.escape(group_title)}</b> guruhidan terilmoqda...\n\n"
+                        f"📥 Yig'ildi: <b>{len(found)}/{participant_limit}</b>"
+                    )
+                except Exception:
+                    pass
+
+        try:
+            await status.edit_text(
+                f"✅ <b>{html.escape(group_title)}</b> guruhidan yig'ildi\n\n"
+                f"📥 Jami: <b>{len(found)}</b> ta"
+            )
+        except Exception:
+            pass
 
         scraped_at = datetime.now(timezone.utc).isoformat()
         async with aiosqlite.connect(DB_FILE) as db:
@@ -2977,11 +3048,14 @@ async def run_scrape_for_count(
             "Ro'yxat shaxsiy chatga 150 tadan bo'lib yuboriladi.",
             reply_markup=await get_user_main_keyboard(uid)
         )
-        if found:
+        username_users = sorted({
+            username for username, _, _ in found.values()
+            if username.startswith("@")
+        })
+        if username_users:
             batch: list[str] = []
             batch_chars = 0
-            for username, fullname, telegram_id in found.values():
-                display = username if username.startswith("@") else f"{fullname or 'A\'zo'} — {telegram_id}"
+            for display in username_users:
                 extra_chars = len(display) + (1 if batch else 0)
                 if batch and (batch_chars + extra_chars > 3900):
                     await bot.send_message(chat_id=int(uid), text="\n".join(batch))
@@ -3015,7 +3089,7 @@ async def cb_scrape_count(callback: CallbackQuery, state: FSMContext):
     except (ValueError, AttributeError):
         await callback.answer("❌ Noto'g'ri son.", show_alert=True)
         return
-    if count not in (100, 200, 500, 1000, 1500):
+    if count not in (100, 200, 500, 1000, 1500, 5000, 10000, 20000):
         await callback.answer("❌ Noto'g'ri son.", show_alert=True)
         return
     data = await state.get_data()
@@ -3035,10 +3109,10 @@ async def scrape_count_input(message: Message, state: FSMContext):
     try:
         count = int(message.text.strip())
     except ValueError:
-        await message.answer("❌ Tugmalardan birini tanlang yoki 1 dan 1500 gacha son kiriting.")
+        await message.answer("❌ Tugmalardan birini tanlang yoki 1 dan 20000 gacha son kiriting.")
         return
-    if not 1 <= count <= 1500:
-        await message.answer("❌ 1 dan 1500 gacha son kiriting.")
+    if not 1 <= count <= 20000:
+        await message.answer("❌ 1 dan 20000 gacha son kiriting.")
         return
     data = await state.get_data()
     mode = data.get("scrape_mode")
