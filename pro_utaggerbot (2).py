@@ -6,10 +6,11 @@ import re
 import random
 import zipfile
 import aiosqlite
-from zoneinfo import ZoneInfo
 from contextvars import ContextVar
 from cryptography.fernet import Fernet, InvalidToken
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+import re
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, types, F
@@ -32,16 +33,26 @@ from telethon.errors import (
     FloodWaitError, UserPrivacyRestrictedError, PeerFloodError,
     PremiumAccountRequiredError, EntityBoundsInvalidError,
     SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError,
-    PasswordHashInvalidError,
+    PasswordHashInvalidError, UserAlreadyParticipantError, UserIdInvalidError,
+    UsernameNotOccupiedError, InputUserDeactivatedError, ChannelPrivateError,
 )
 from telethon.tl.types import (
     UserStatusOnline, Chat, DocumentAttributeCustomEmoji, InputStickerSetShortName,
-    MessageEntityCustomEmoji, MessageEntityMentionName, ChannelParticipantsAdmins,
+    MessageEntityCustomEmoji, MessageEntityMentionName, MessageEntityBold,
+    MessageEntityItalic, MessageEntityUnderline, MessageEntityStrike,
+    MessageEntityCode, MessageEntityPre, MessageEntityTextUrl,
+    MessageEntitySpoiler, MessageEntityBlockquote, MessageEntityMention,
+    ChannelParticipantsAdmins, ChannelParticipantsSearch,
 )
 from telethon.utils import get_display_name, get_peer_id
-from telethon.tl.functions.messages import GetStickerSetRequest
+from telethon.tl.functions.messages import (
+    AddChatUserRequest,
+    GetCustomEmojiDocumentsRequest,
+    GetStickerSetRequest,
+)
+from telethon.tl.functions.channels import InviteToChannelRequest, GetParticipantsRequest
 from telethon.tl.functions.account import UpdateProfileRequest
-from telethon.tl.functions.users import GetFullUserRequest
+from telethon.tl.functions.users import GetFullUserRequest, GetUsersRequest
 from urllib.parse import urlparse
 from telethon.utils import get_display_name, get_peer_id
 
@@ -75,15 +86,16 @@ BOT_TOKEN = required_env("BOT_TOKEN").strip()
 ADMIN_ID  = required_int_env("ADMIN_ID", "Set the numeric Telegram user ID.")
 if ADMIN_ID <= 0:
     raise RuntimeError("ADMIN_ID must be a positive Telegram user ID")
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@owapro")
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@sodoroq")
 IS_RENDER_SERVICE = bool(os.getenv("RENDER_SERVICE_ID"))
 DB_FILE = "database22.db" if IS_RENDER_SERVICE else os.getenv("DB_FILE", "database22.db")
 CLONE_TOKEN_ENCRYPTION_KEY = os.getenv("CLONE_TOKEN_ENCRYPTION_KEY", "").strip()
 CUSTOM_EMOJI_PACK = os.getenv("CUSTOM_EMOJI_PACK", "").strip()
-FREE_MODE = os.getenv("FREE_MODE", "1").strip().lower() not in {"0", "false", "no"}
+FREE_MODE = False
 
-AD_TEXT = "🤖 Powered by @Prime_utaggerbot 🚀"
-BIO_AD_TEXT = "🤖 Powered by @Prime_utaggerbot 🚀"
+AD_TEXT = "🤖 Powered by @Yomonkuubot 🚀"
+BIO_AD_TEXT = "🤖 Powered by @Yomonkuubot 🚀"
+OLD_BIO_AD_TEXT = "🤖 Powered by @Prime_utaggerbot 🚀"
 AUTO_REPLY_AD = f"{AD_TEXT}\n🤖 Avto javob qilindi."
 DEFAULT_AUTO_REPLY_TEXT = "Assalomu alaykum! Hozirda bandman, bo'shashim bilan sizga javob beraman."
 SOURCE_FILE = os.getenv("SOURCE_FILE", __file__)
@@ -130,93 +142,9 @@ _button_catalog: dict[str, str] = {}
 _button_emoji_target_keys: list[str] = []
 _button_styles = ("success", "primary", "danger")
 _button_style_index = 0
-_clock_tasks: dict[str, asyncio.Task] = {}
 bot_username = ""
 clone_bots: dict[int, Bot] = {}
 clone_polling_tasks: dict[int, asyncio.Task] = {}
-
-CLOCK_FORMATS = {
-    "plain": "1234567890",
-    "bold": "𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗𝟎",
-    "double": "𝟙𝟚𝟛𝟒𝟓𝟞𝟟𝟠𝟡𝟘",
-    "sans": "𝟣𝟤𝟥𝟦𝟧𝟨𝟩𝟪𝟫𝟢",
-    "mono": "𝟷𝟸𝟥𝟺𝟻𝟼𝟽𝟾𝟿𝟶",
-}
-
-
-def format_clock(style: str, value: datetime | None = None) -> str:
-    style = style if style in CLOCK_FORMATS else "plain"
-    value = value or datetime.now(ZoneInfo("Asia/Tashkent"))
-    time_text = value.strftime("%H:%M")
-    digits = CLOCK_FORMATS[style]
-    plain_digits = "0123456789"
-    translated = "".join(digits[plain_digits.index(char)] if char.isdigit() else char for char in time_text)
-    return translated
-
-
-def clock_style_keyboard(selected: str) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    for code, title in (
-        ("plain", "Oddiy"),
-        ("bold", "Bold"),
-        ("double", "Double-struck"),
-        ("sans", "Sans-serif"),
-        ("mono", "Monospace"),
-    ):
-        check = "✅ " if code == selected else ""
-        kb.row(InlineKeyboardButton(
-            text=f"{check}{title}: {format_clock(code)}",
-            callback_data=f"clock_style:{code}",
-        ))
-    kb.row(InlineKeyboardButton(text="🛑 Soatni o'chirish", callback_data="clock_disable"))
-    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="main_menu"))
-    return kb.as_markup()
-
-
-async def update_profile_clock(owner_id: str, style: str, enabled: bool = True):
-    client = userbot_clients.get(owner_id)
-    if not client:
-        return False
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute(
-            "SELECT original_last_name FROM profile_clock_settings WHERE owner_id = ?", (owner_id,)
-        ) as cur:
-            row = await cur.fetchone()
-    me = await client.get_me()
-    original_last_name = row[0] if row and row[0] is not None else (me.last_name or "")
-    clock = format_clock(style)
-    last_name = clock if enabled else original_last_name
-    await client(UpdateProfileRequest(last_name=last_name[:64]))
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute(
-            "INSERT INTO profile_clock_settings "
-            "(owner_id, enabled, style, original_last_name, updated_at) VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(owner_id) DO UPDATE SET enabled = excluded.enabled, "
-            "style = excluded.style, original_last_name = COALESCE(profile_clock_settings.original_last_name, excluded.original_last_name), "
-            "updated_at = excluded.updated_at",
-            (owner_id, int(enabled), style, original_last_name, datetime.now(timezone.utc).isoformat()),
-        )
-        await db.commit()
-    return True
-
-
-async def profile_clock_worker(owner_id: str):
-    while True:
-        try:
-            async with aiosqlite.connect(DB_FILE) as db:
-                async with db.execute(
-                    "SELECT enabled, style FROM profile_clock_settings WHERE owner_id = ?", (owner_id,)
-                ) as cur:
-                    row = await cur.fetchone()
-            if not row or not row[0] or owner_id not in userbot_clients:
-                await asyncio.sleep(30)
-                continue
-            await update_profile_clock(owner_id, row[1], enabled=True)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            log.warning("Profil soatini yangilashda xato (%s): %s", owner_id, exc)
-        await asyncio.sleep(60)
 
 
 def is_clone_bot() -> bool:
@@ -241,8 +169,7 @@ def clone_token_cipher() -> Fernet:
 def _build_emoji_button(button_type, text: str, kwargs: dict):
     global _button_style_index
     if "style" not in kwargs:
-        # Premium Telegram button styles: primary is blue and success is green.
-        kwargs["style"] = "primary"
+        kwargs["style"] = _button_styles[_button_style_index % len(_button_styles)]
         _button_style_index += 1
     key = str(kwargs.get("callback_data") or kwargs.get("url") or text)
     if key and not key.startswith(("button_emoji_", "admin_custom_emoji", "admin_button_emoji")):
@@ -277,6 +204,7 @@ class UserStatesGroup(StatesGroup):
     scrape_group_select = State()
     scrape_mode        = State()
     scrape_count       = State()
+    scrape_group_link  = State()
     admin_broadcast        = State()
     admin_add_channel      = State()
     admin_raid_add_group   = State()
@@ -284,9 +212,12 @@ class UserStatesGroup(StatesGroup):
     admin_raid_profile     = State()
     admin_custom_emoji_pack = State()
     admin_give_pro         = State()
-    admin_clone_price      = State()
-    clone_token_input      = State()
-    ban_target_input       = State()
+    admin_pro_price        = State()
+    member_add_package     = State()
+    member_add_group       = State()
+    member_add_admin       = State()
+    member_add_users       = State()
+    admin_member_add_price = State()
     contest_channel        = State()
     contest_max_users      = State()
     contest_req_channels   = State()
@@ -358,30 +289,18 @@ async def init_db():
             updated_at TEXT
         )""")
         await db.execute("""
-        CREATE TABLE IF NOT EXISTS profile_clock_settings (
-            owner_id TEXT PRIMARY KEY,
-            enabled INTEGER NOT NULL DEFAULT 0,
-            style TEXT NOT NULL DEFAULT 'plain',
-            original_last_name TEXT,
-            updated_at TEXT
-        )""")
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS diamond_settings (
-            owner_id TEXT PRIMARY KEY,
-            enabled INTEGER NOT NULL DEFAULT 0,
-            auto_claim INTEGER NOT NULL DEFAULT 0,
-            updated_at TEXT
-        )""")
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS diamond_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        CREATE TABLE IF NOT EXISTS auto_message_daily_usage (
             owner_id TEXT NOT NULL,
-            chat_id TEXT,
-            source_username TEXT,
-            event_type TEXT NOT NULL,
-            amount INTEGER NOT NULL DEFAULT 0,
-            details TEXT,
-            created_at TEXT NOT NULL
+            usage_date TEXT NOT NULL,
+            sent_count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (owner_id, usage_date)
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS scrape_daily_usage (
+            owner_id TEXT NOT NULL,
+            usage_date TEXT NOT NULL,
+            scraped_count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (owner_id, usage_date)
         )""")
         await db.execute("""
         CREATE TABLE IF NOT EXISTS bot_settings (
@@ -407,6 +326,17 @@ async def init_db():
             order_id TEXT NOT NULL UNIQUE,
             created_at TEXT NOT NULL,
             active INTEGER NOT NULL DEFAULT 1
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS paid_feature_orders (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            payload TEXT NOT NULL UNIQUE,
+            feature TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            telegram_charge_id TEXT,
+            created_at TEXT NOT NULL
         )""")
         await db.execute("""
         CREATE TABLE IF NOT EXISTS raid_groups (
@@ -443,6 +373,66 @@ async def init_db():
             fullname TEXT NOT NULL,
             last_seen TEXT NOT NULL,
             PRIMARY KEY (chat_id, user_id)
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS member_add_prices (
+            package_count INTEGER PRIMARY KEY,
+            price INTEGER NOT NULL DEFAULT 0
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS member_add_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            package_count INTEGER NOT NULL,
+            target_chat TEXT NOT NULL,
+            invite_profile TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'waiting_list',
+            added_count INTEGER NOT NULL DEFAULT 0,
+            failed_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS member_add_daily_usage (
+            owner_id TEXT NOT NULL,
+            usage_date TEXT NOT NULL,
+            added_count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (owner_id, usage_date)
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS member_add_trials (
+            owner_id TEXT PRIMARY KEY,
+            started_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS member_add_credits (
+            owner_id TEXT PRIMARY KEY,
+            remaining_count INTEGER NOT NULL DEFAULT 0
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS profile_clock_settings (
+            user_id TEXT PRIMARY KEY,
+            timezone TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 0
+        )""")
+        try:
+            await db.execute(
+                "ALTER TABLE profile_clock_settings ADD COLUMN clock_font TEXT NOT NULL DEFAULT 'normal'"
+            )
+        except aiosqlite.OperationalError:
+            pass
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS profile_clock_names (
+            user_id TEXT PRIMARY KEY,
+            first_name TEXT NOT NULL DEFAULT '',
+            last_name TEXT NOT NULL DEFAULT ''
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS member_add_users (
+            order_id INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            username TEXT NOT NULL,
+            PRIMARY KEY (order_id, position)
         )""")
         try:
             await db.execute(
@@ -677,15 +667,70 @@ def is_pro_user(pro_until_str: str | None) -> bool:
     except Exception:
         return False
 
+
+async def grant_pro(uid: str, days: int) -> str:
+    now = datetime.now(timezone.utc)
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute("SELECT pro_until FROM users WHERE id = ?", (uid,)) as cur:
+            row = await cur.fetchone()
+    base = now
+    if row and row[0]:
+        try:
+            current = datetime.fromisoformat(row[0])
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=timezone.utc)
+            if current > now:
+                base = current
+        except (TypeError, ValueError):
+            pass
+    new_pro = (base + timedelta(days=days)).isoformat()
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "UPDATE users SET pro_until = ?, notified_10m = 0 WHERE id = ?",
+            (new_pro, uid),
+        )
+        await db.commit()
+    return new_pro
+
 def make_text_unique(text: str) -> str:
     if not text:
         return ""
-    invisible = ["\u200c", "\u200d", "\u200b"]
-    return f"{text}{''.join(random.choices(invisible, k=3))}"
+    return text
 
 
 def utf16_length(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
+
+
+def get_user_mention_name(user) -> str:
+    username = str(getattr(user, "username", "") or "").strip().lstrip("@")
+    if username:
+        return f"@{username}"
+
+    display_name = get_display_name(user).strip()
+    if display_name and display_name.lower() not in {"deleted account", "none", "null"}:
+        return display_name.replace("#", "").strip()
+
+    return (
+        " ".join(filter(None, (
+            getattr(user, "first_name", None),
+            getattr(user, "last_name", None),
+        ))).strip() or f"Foydalanuvchi {getattr(user, 'id', '')}".strip()
+    )
+
+
+def get_user_mention_entities(
+    user,
+    mention: str,
+) -> list[MessageEntityMentionName]:
+    user_id = getattr(user, "id", None)
+    if user_id is None:
+        return []
+    return [MessageEntityMentionName(
+        offset=0,
+        length=utf16_length(mention),
+        user_id=int(user_id),
+    )]
 
 
 # Random uTag uchun 50 tadan ko'p kulgili so'zlar.
@@ -769,36 +814,26 @@ def make_random_utag_text(
     user,
     custom_emoji: tuple[int, str] | None = None,
     random_words: list[str] | None = None,
-) -> tuple[str, list[MessageEntityCustomEmoji | MessageEntityMentionName]]:
+) -> tuple[str, list[MessageEntityMentionName]]:
     """Username va guruh/bot so'zlari bilan random uTag."""
-    username = getattr(user, "username", None)
-    if username:
-        mention = f"@{username}"
-    else:
-        mention = get_display_name(user).replace("#", "").strip() or "do'stimiz"
+    mention = get_user_mention_name(user)
     word = random.choice(random_words or RANDOM_UTAG_WORDS)
-    emoji_text = custom_emoji[1] if custom_emoji else ""
-    text = f"{mention}, {word}{emoji_text}"
-    entities: list[MessageEntityCustomEmoji | MessageEntityMentionName] = []
-    if not username:
-        entities.append(MessageEntityMentionName(
-            offset=0,
-            length=utf16_length(mention),
-            user_id=user.id,
-        ))
-    if custom_emoji:
-        entities.append(MessageEntityCustomEmoji(
-            offset=utf16_length(text) - utf16_length(emoji_text),
-            length=utf16_length(emoji_text),
-            document_id=custom_emoji[0],
-        ))
+    text = f"{mention}, {word}"
+    entities: list[MessageEntityMentionName] = []
+    entities.extend(get_user_mention_entities(user, mention))
     return text, entities
 
 
 def make_bot_random_tag(user_id: str, username: str | None, fullname: str, word: str) -> str:
-    mention = f"@{username}" if username else (
-        f'<a href="tg://user?id={user_id}">{html.escape(fullname)}</a>'
-    )
+    clean_username = str(username or "").strip().lstrip("@")
+    if clean_username:
+        display_name = f"@{clean_username}"
+    else:
+        display_name = fullname.strip() if fullname.strip() else "A'zo"
+
+    display_name = html.escape(display_name)
+    profile_url = f"tg://user?id={html.escape(str(user_id).strip())}"
+    mention = f'<a href="{profile_url}">{display_name}</a>'
     return f"{mention}, {html.escape(word)}"
 
 
@@ -822,22 +857,11 @@ async def run_bot_utag(chat_id: int, random_mode: bool):
             if word not in {"uchun", "bilan", "ham", "bir", "bu", "va"}
         ][:40]
         words = list(dict.fromkeys(words + popular))
-    custom_emojis = []
-    if random_mode:
-        if not _custom_emoji_pack_cache:
-            owner_client = userbot_clients.get(str(ADMIN_ID))
-            if owner_client:
-                await get_custom_emoji_pack(owner_client)
-        custom_emojis = _custom_emoji_pack_cache
-
     try:
         for user_id, username, fullname in reversed(members):
             word = random.choice(words) if random_mode else ""
             text = make_bot_random_tag(user_id, username, fullname, word)
-            if random_mode and custom_emojis:
-                emoji_id, _ = random.choice(custom_emojis)
-                text += f'<tg-emoji emoji-id="{emoji_id}">x</tg-emoji>'
-            await bot.send_message(chat_id, text)
+            await bot.send_message(chat_id, text, parse_mode="HTML")
             await asyncio.sleep(0.7)
     except asyncio.CancelledError:
         raise
@@ -847,7 +871,7 @@ async def run_bot_utag(chat_id: int, random_mode: bool):
 
 @dp.message(F.chat.type.in_({"group", "supergroup"}))
 async def bot_group_utag_handler(message: Message):
-    if not message.from_user or message.from_user.is_bot:
+    if not message.from_user:
         return
     chat_id = int(message.chat.id)
     username = message.from_user.username
@@ -883,31 +907,13 @@ async def bot_group_utag_handler(message: Message):
         counts[token] = counts.get(token, 0) + 1
 
     command = (message.text or "").strip().lower()
-    if command in {"/tagall", ".tagall"}:
-        async with aiosqlite.connect(DB_FILE) as db:
-            async with db.execute(
-                "SELECT user_id, username, fullname FROM bot_group_members "
-                "WHERE chat_id = ? ORDER BY last_seen DESC LIMIT 500",
-                (str(chat_id),),
-            ) as cur:
-                members = await cur.fetchall()
-        if not members:
-            await message.answer("Hali guruhdan userlar yig'ilmadi.")
-            return
-        batch: list[str] = []
-        for user_id, username, fullname in reversed(members):
-            if username:
-                batch.append(html.escape(f"@{username}"))
-            else:
-                batch.append(f'<a href="tg://user?id={html.escape(str(user_id))}">{html.escape(fullname)}</a>')
-            if len(batch) >= 20:
-                await message.answer("\n".join(batch), parse_mode="HTML")
-                batch = []
-                await asyncio.sleep(1)
-        if batch:
-            await message.answer("\n".join(batch), parse_mode="HTML")
+    if command in {".f", "/f"}:
+        old_task = _bot_utag_tasks.get(chat_id)
+        if old_task and not old_task.done():
+            old_task.cancel()
         return
-    if command not in {".u", "/u", ".r", "/r", ".ru", "/ru"}:
+
+    if command not in {".s", "/s", ".u", "/u", ".r", "/r", ".ru", "/ru"}:
         return
     old_task = _bot_utag_tasks.get(chat_id)
     if old_task and not old_task.done():
@@ -959,20 +965,19 @@ def build_auto_reply_text(response_text: str, pro: bool) -> str:
 # PRO BIO MANAGEMENT
 # ─────────────────────────────────────────────
 async def set_ad_bio(client: TelegramClient, is_pro: bool):
-    """Pro bo'lmasa bio ga reklama qoy, pro bo'lsa tozala."""
+    """Barcha bot foydalanuvchilari bio'siga reklamani avtomatik qo'shadi."""
     if not BIO_AD_TEXT:
         return
     try:
         full = await client(GetFullUserRequest("me"))
         current_bio = full.full_user.about or ""
-        if is_pro:
-            if BIO_AD_TEXT not in current_bio:
-                return
-            new_bio = current_bio.replace(BIO_AD_TEXT, "").strip()
-        else:
-            if BIO_AD_TEXT in current_bio:
-                return
-            new_bio = (current_bio + "\n" + BIO_AD_TEXT).strip()
+        current_bio = current_bio.replace(OLD_BIO_AD_TEXT, "").strip()
+        if BIO_AD_TEXT in current_bio:
+            return
+        bio_without_ad = current_bio.replace(BIO_AD_TEXT, "").strip()
+        separator = "\n" if bio_without_ad else ""
+        available = max(0, 70 - len(BIO_AD_TEXT) - len(separator))
+        new_bio = (bio_without_ad[:available].rstrip() + separator + BIO_AD_TEXT).strip()
         await client(UpdateProfileRequest(about=new_bio[:70]))
     except Exception as e:
         log.error(f"Bio yangilashda xato: {e}")
@@ -1008,6 +1013,115 @@ async def bio_watcher():
             log.error(f"bio_watcher umumiy xato: {e}")
         await asyncio.sleep(300)  # 5 daqiqa
 
+
+CLOCK_ZONES = {
+    "uzbekistan": ("🇺🇿 O'zbekiston", "Asia/Tashkent"),
+    "russia": ("🇷🇺 Rossiya", "Europe/Moscow"),
+    "ukraine": ("🇺🇦 Ukraina", "Europe/Kyiv"),
+    "usa": ("🇺🇸 AQSh", "America/New_York"),
+    "kazakhstan": ("🇰🇿 Qozog'iston", "Asia/Almaty"),
+}
+CLOCK_FONTS = {
+    "normal": ("🅰 Oddiy", "0123456789"),
+    "bold": ("𝗔 Qalin", "0123456789"),
+    "italic": ("𝐴 Inglizcha italic", "0123456789"),
+    "script": ("𝒜 Kalligrafiya", "0123456789"),
+    "mono": ("𝙰 Mono", "0123456789"),
+}
+CLOCK_MARKER_RE = re.compile(r"^.{2}[;：:].{2}(?:\s+.*)?$")
+
+
+def format_clock_digits(value: str, font: str = "normal") -> str:
+    if font == "normal":
+        return value
+    maps = {
+        "bold": str.maketrans("0123456789", "𝟎𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗"),
+        "italic": str.maketrans("0123456789", "0123456789"),
+        "script": str.maketrans("0123456789", "𝟘𝟙𝟚𝟛𝟜𝟝𝟞𝟟𝟠𝟡"),
+        "mono": str.maketrans("0123456789", "𝟶𝟷𝟸𝟹𝟺𝟻𝟼𝟽𝟾𝟿"),
+    }
+    if font == "italic":
+        styled = str.maketrans("0123456789", "⓪①②③④⑤⑥⑦⑧⑨")
+        return value.translate(styled)
+    return value.translate(maps.get(font, maps["bold"]))
+
+
+async def update_profile_clock(client: TelegramClient, uid: str) -> bool:
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT timezone, enabled, clock_font FROM profile_clock_settings WHERE user_id = ?",
+            (uid,),
+        ) as cur:
+            row = await cur.fetchone()
+    if not row or not row[1]:
+        return False
+    zone_name = row[0]
+    zone_data = CLOCK_ZONES.get(zone_name)
+    if not zone_data:
+        return False
+    try:
+        now = datetime.now(ZoneInfo(zone_data[1]))
+        full = await client(GetFullUserRequest("me"))
+        user = getattr(full, "user", None)
+        if not user:
+            return False
+        async with aiosqlite.connect(DB_FILE) as db:
+            async with db.execute(
+                "SELECT first_name, last_name FROM profile_clock_names WHERE user_id = ?",
+                (uid,),
+            ) as cur:
+                saved = await cur.fetchone()
+            if not saved:
+                await db.execute(
+                    "INSERT INTO profile_clock_names(user_id, first_name, last_name) "
+                    "VALUES (?, ?, ?)",
+                    (uid, user.first_name or "", user.last_name or ""),
+                )
+                await db.commit()
+                original_first = user.first_name or ""
+                original_last = user.last_name or ""
+            else:
+                original_first = saved[0]
+                original_last = saved[1]
+        last_name = CLOCK_MARKER_RE.sub("", user.last_name or "").strip()
+        if last_name == original_last:
+            last_name = original_last
+        clock_text = format_clock_digits(now.strftime("%H;%M"), row[2] if len(row) > 2 else "normal")
+        clock_last_name = clock_text
+        if user.first_name != original_first or user.last_name != clock_last_name:
+            await client(UpdateProfileRequest(
+                first_name=original_first,
+                last_name=clock_last_name[:64],
+            ))
+        return True
+    except Exception as exc:
+        log.error("Profile clock update failed for %s: %s", uid, exc)
+        return False
+
+
+async def profile_clock_watcher():
+    await asyncio.sleep(20)
+    while True:
+        try:
+            async with aiosqlite.connect(DB_FILE) as db:
+                async with db.execute(
+                    "SELECT user_id FROM profile_clock_settings WHERE enabled = 1"
+                ) as cur:
+                    rows = await cur.fetchall()
+            for (uid,) in rows:
+                client = userbot_clients.get(uid)
+                if not client:
+                    continue
+                try:
+                    if not client.is_connected():
+                        await client.connect()
+                    await update_profile_clock(client, uid)
+                except Exception as exc:
+                    log.error("Profile clock watcher user %s: %s", uid, exc)
+        except Exception as exc:
+            log.error("Profile clock watcher failed: %s", exc)
+        await asyncio.sleep(60)
+
 # ─────────────────────────────────────────────
 # KEYBOARDS
 # ─────────────────────────────────────────────
@@ -1030,28 +1144,25 @@ def get_main_keyboard(
     kb = InlineKeyboardBuilder()
     kb.row(
         InlineKeyboardButton(text="🔷 Userbotni sozlash", callback_data="btn_userbot"),
-        InlineKeyboardButton(text="⚙️ Sozlamalar", callback_data="btn_settings", style="success")
+        InlineKeyboardButton(text="⚙️ Sozlamalar", callback_data="btn_settings")
     )
     kb.row(
         InlineKeyboardButton(text="💠 Avto Xabar", callback_data="btn_auto_msg"),
-        InlineKeyboardButton(text="💠 Avto Javob", callback_data="btn_auto_reply", style="success")
-    )
-    kb.row(
-        InlineKeyboardButton(text="🕐 Profil soati", callback_data="clock_menu"),
-        InlineKeyboardButton(text="💎 Olmos nazorati", callback_data="diamond_menu", style="success")
+        InlineKeyboardButton(text="💠 Avto Javob", callback_data="btn_auto_reply")
     )
     kb.row(
         InlineKeyboardButton(text="💠 User Yig'ish", callback_data="btn_scrape"),
-        InlineKeyboardButton(text="🆓 Bepul rejim", callback_data="btn_pro_info", style="success")
+        InlineKeyboardButton(text="💎 PRO obuna", callback_data="btn_pro_info")
     )
+    kb.row(InlineKeyboardButton(text="👥 Guruhga a'zo qo'shish", callback_data="member_add"))
     kb.row(
         InlineKeyboardButton(text="👤 Profil", callback_data="profile"),
-        InlineKeyboardButton(text="📱 Akauntlar", callback_data="btn_userbot", style="success")
+        InlineKeyboardButton(text="📱 Akauntlar", callback_data="btn_userbot")
     )
     kb.row(
         InlineKeyboardButton(text="📖 Yordam", callback_data="help"),
-        InlineKeyboardButton(text="📜 Qoidalar", callback_data="rules", style="success"),
-        InlineKeyboardButton(text="💰 Tariflar", callback_data="prices", style="success")
+        InlineKeyboardButton(text="📜 Qoidalar", callback_data="rules"),
+        InlineKeyboardButton(text="💰 Tariflar", callback_data="prices")
     )
     return kb.as_markup()
 
@@ -1063,6 +1174,13 @@ async def user_has_active_pro(user_id: int | str) -> bool:
         ) as cur:
             row = await cur.fetchone()
     return is_pro_user(row[0] if row else None)
+
+
+def get_limit_reached_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="💎 PRO sotib olish", callback_data="settings_buy_pro"))
+    kb.row(InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="main_menu"))
+    return kb.as_markup()
 
 
 async def user_has_raid_access(user_id: int | str) -> bool:
@@ -1129,7 +1247,7 @@ def get_userbot_keyboard(acc_name: str | None) -> InlineKeyboardMarkup:
 
 def back_kb(cb: str = "main_menu") -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data=cb, style="success"))
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data=cb))
     return kb.as_markup()
 
 def get_settings_keyboard() -> InlineKeyboardMarkup:
@@ -1137,7 +1255,7 @@ def get_settings_keyboard() -> InlineKeyboardMarkup:
     kb.row(InlineKeyboardButton(text="📖 uTag qanday ishlaydi?", callback_data="settings_how_utag"))
     kb.row(InlineKeyboardButton(text="⚡ uTag tezligini sozlash", callback_data="settings_utag_speed"))
     kb.row(InlineKeyboardButton(
-        text="🆓 Bepul tarif" if FREE_MODE else "💳 Reklama sotib olish (PRO)",
+        text="💎 PRO obuna sotib olish",
         callback_data="settings_buy_pro"
     ))
     kb.row(InlineKeyboardButton(text="📢 Kanal havolam", callback_data="settings_my_ref"))
@@ -1186,7 +1304,7 @@ async def pro_expiration_checker():
                                 await bot.send_message(
                                     int(uid),
                                     "⚠️ <b>Sizning pro tarif rejangiz tugamoqda!</b>\n\n"
-                                    "Agar yana sotib olmoqchi bo'lsangiz @owapro ga murojaat qiling "
+                                    "Agar yana sotib olmoqchi bo'lsangiz @sodoroq ga murojaat qiling "
                                     "yoki yana 3 ta do'stingizni botimizga taklif qiling."
                                 )
                             except Exception:
@@ -1232,18 +1350,20 @@ async def pro_expiration_checker():
 def get_start_message(first_name: str, user_id: int) -> str:
     safe_name = html.escape(first_name)
     if str(user_id) not in userbot_clients:
-        return (
+        text = (
             f"💠 Assalom alaykum, <b>{safe_name}</b>!\n\n"
             "Bot funksiyalarini ochish uchun avval Telegram akkauntingizni ulang.\n"
             "📱 Pastdagi <b>Akkaunt ulash</b> tugmasini bosing."
         )
-    text = (
-        f"💠 Assalom alaykum, <b>{safe_name}</b>!\n\n"
-        "Ushbu bot orqali o'z Telegram profilingizni ulab, guruhlarda xavfsiz "
-        "<b>uTag</b> qilishingiz, <b>avto xabar</b> yuborish va <b>user yig'ish</b> mumkin."
-    )
+    else:
+        text = (
+            f"💠 Assalom alaykum, <b>{safe_name}</b>!\n\n"
+            "Ushbu bot orqali o'z Telegram profilingizni ulab, guruhlarda xavfsiz "
+            "<b>uTag</b> qilishingiz, <b>avto xabar</b> yuborish va <b>user yig'ish</b> mumkin."
+        )
     if str(user_id) in userbot_clients:
         text += "\n\n" + get_utag_command_help()
+    text += f"\n\nBot {ADMIN_USERNAME} tomonidan yaratildi"
     return text
 
 
@@ -1352,96 +1472,6 @@ async def cb_check_sub(callback: CallbackQuery, state: FSMContext):
         reply_markup=await get_user_main_keyboard(callback.from_user.id)
     )
 
-@dp.callback_query(F.data == "clock_menu")
-async def cb_clock_menu(callback: CallbackQuery):
-    uid = str(callback.from_user.id)
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute(
-            "SELECT enabled, style FROM profile_clock_settings WHERE owner_id = ?", (uid,)
-        ) as cur:
-            row = await cur.fetchone()
-    selected = row[1] if row else "plain"
-    await callback.message.edit_text(
-        "🕐 <b>Profildagi soat</b>\n\nQuyidagi 5 uslubdan birini tanlang.\n"
-        "Ulanmagan yoki Telegram profilini o'zgartirishga ruxsat bermagan akkauntlarda faol bo'lmaydi.",
-        reply_markup=clock_style_keyboard(selected),
-    )
-
-
-@dp.callback_query(F.data.startswith("clock_style:"))
-async def cb_clock_style(callback: CallbackQuery):
-    uid = str(callback.from_user.id)
-    style = callback.data.split(":", 1)[1]
-    if style not in CLOCK_FORMATS or uid not in userbot_clients:
-        await callback.answer("Avval Telegram akkauntini ulang.", show_alert=True)
-        return
-    await update_profile_clock(uid, style, enabled=True)
-    task = _clock_tasks.get(uid)
-    if not task or task.done():
-        _clock_tasks[uid] = asyncio.create_task(profile_clock_worker(uid))
-    await callback.answer(f"✅ {format_clock(style)} profilga o'rnatildi.")
-    await callback.message.edit_text(
-        "🕐 <b>Profildagi soat</b>\n\nSoat har daqiqada avtomatik yangilanadi.",
-        reply_markup=clock_style_keyboard(style),
-    )
-
-
-@dp.callback_query(F.data == "clock_disable")
-async def cb_clock_disable(callback: CallbackQuery):
-    uid = str(callback.from_user.id)
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute(
-            "SELECT style FROM profile_clock_settings WHERE owner_id = ?", (uid,)
-        ) as cur:
-            row = await cur.fetchone()
-    style = row[0] if row else "plain"
-    if uid in userbot_clients:
-        await update_profile_clock(uid, style, enabled=False)
-    await callback.answer("Profil soati o'chirildi.")
-    await callback.message.edit_text(
-        "🕐 <b>Profildagi soat</b>\n\nSoat o'chirilgan.",
-        reply_markup=clock_style_keyboard(style),
-    )
-
-
-@dp.callback_query(F.data == "diamond_menu")
-async def cb_diamond_menu(callback: CallbackQuery):
-    uid = str(callback.from_user.id)
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute(
-            "SELECT enabled, auto_claim FROM diamond_settings WHERE owner_id = ?", (uid,)
-        ) as cur:
-            settings = await cur.fetchone()
-        async with db.execute(
-            "SELECT COALESCE(SUM(CASE WHEN event_type IN ('received', 'claim') THEN amount "
-            "WHEN event_type = 'spent' THEN -amount ELSE 0 END), 0) FROM diamond_events WHERE owner_id = ?",
-            (uid,),
-        ) as cur:
-            balance = int((await cur.fetchone())[0])
-    enabled = bool(settings and settings[0])
-    auto_claim = bool(settings and settings[1])
-    kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(
-        text=f"{'✅ ' if enabled else ''}Auto Diamond Checker",
-        callback_data="diamond_toggle_checker",
-    ))
-    kb.row(InlineKeyboardButton(
-        text=f"{'✅ ' if auto_claim else '⚠️ '}Rasmiy Auto Claim",
-        callback_data="diamond_toggle_claim",
-    ))
-    kb.row(InlineKeyboardButton(text="💎 Diamond Balance", callback_data="diamond_balance"))
-    kb.row(InlineKeyboardButton(text="📜 Diamond History", callback_data="diamond_history"))
-    kb.row(InlineKeyboardButton(text="🔎 Bot Finder", callback_data="diamond_bot_finder"))
-    kb.row(InlineKeyboardButton(text="📊 Daily Statistics", callback_data="diamond_stats"))
-    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="main_menu"))
-    await callback.message.edit_text(
-        "💎 <b>Olmos nazorati</b>\n\n"
-        f"Joriy balans: <b>{balance}</b>\n"
-        "Avto olish faqat foydalanuvchi berilgan, rasmiy Bot API manba va ko'rinadigan "
-        "mukofot tugmalariga qaratilgan. Boshqa akkaunt yoki yomon niyatli botlardan ruxsatsiz mukofot olish mumkin emas.",
-        reply_markup=kb.as_markup(),
-    )
-
 # ─────────────────────────────────────────────
 # MAIN MENU callback
 # ─────────────────────────────────────────────
@@ -1460,116 +1490,6 @@ async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
         get_start_message(callback.from_user.first_name or "", callback.from_user.id),
         reply_markup=await get_user_main_keyboard(callback.from_user.id)
     )
-
-
-@dp.callback_query(F.data == "diamond_toggle_checker")
-async def cb_diamond_toggle_checker(callback: CallbackQuery):
-    uid = str(callback.from_user.id)
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute("SELECT enabled FROM diamond_settings WHERE owner_id = ?", (uid,)) as cur:
-            row = await cur.fetchone()
-        enabled = 0 if row and row[0] else 1
-        await db.execute(
-            "INSERT INTO diamond_settings (owner_id, enabled, auto_claim, updated_at) VALUES (?, ?, 0, ?) "
-            "ON CONFLICT(owner_id) DO UPDATE SET enabled = ?, updated_at = excluded.updated_at",
-            (uid, enabled, datetime.now(timezone.utc).isoformat(), enabled),
-        )
-        await db.commit()
-    await callback.answer("✅ Kuzatuv yoqildi." if enabled else "Kuzatuv o'chirildi.")
-    await cb_diamond_menu(callback)
-
-
-@dp.callback_query(F.data == "diamond_toggle_claim")
-async def cb_diamond_toggle_claim(callback: CallbackQuery):
-    uid = str(callback.from_user.id)
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute("SELECT auto_claim FROM diamond_settings WHERE owner_id = ?", (uid,)) as cur:
-            row = await cur.fetchone()
-        auto_claim = 0 if row and row[0] else 1
-        await db.execute(
-            "INSERT INTO diamond_settings (owner_id, enabled, auto_claim, updated_at) VALUES (?, 1, ?, ?) "
-            "ON CONFLICT(owner_id) DO UPDATE SET enabled = 1, auto_claim = ?, updated_at = excluded.updated_at",
-            (uid, auto_claim, datetime.now(timezone.utc).isoformat(), auto_claim),
-        )
-        await db.commit()
-    await callback.answer(
-        "Rasmiy tugmalar uchun Auto Claim yoqildi."
-        if auto_claim else "Auto Claim o'chirildi.",
-        show_alert=bool(auto_claim),
-    )
-    await cb_diamond_menu(callback)
-
-
-@dp.callback_query(F.data == "diamond_balance")
-async def cb_diamond_balance(callback: CallbackQuery):
-    uid = str(callback.from_user.id)
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute(
-            "SELECT COALESCE(SUM(CASE WHEN event_type IN ('received', 'claim') THEN amount "
-            "WHEN event_type = 'spent' THEN -amount ELSE 0 END), 0) FROM diamond_events WHERE owner_id = ?",
-            (uid,),
-        ) as cur:
-            balance = int((await cur.fetchone())[0])
-    await callback.answer(f"Joriy balans: {balance} olmos", show_alert=True)
-
-
-@dp.callback_query(F.data == "diamond_history")
-async def cb_diamond_history(callback: CallbackQuery):
-    uid = str(callback.from_user.id)
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute(
-            "SELECT event_type, amount, details, created_at FROM diamond_events "
-            "WHERE owner_id = ? ORDER BY created_at DESC LIMIT 20", (uid,)
-        ) as cur:
-            rows = await cur.fetchall()
-    lines = ["📜 <b>Olmos tarixi</b>"]
-    for event_type, amount, details, created_at in rows:
-        sign = "-" if event_type == "spent" else "+"
-        lines.append(f"{sign}{amount} — {html.escape(details or event_type)}")
-    if len(lines) == 1:
-        lines.append("Hozircha yozuv yo'q.")
-    await callback.message.edit_text("\n".join(lines), reply_markup=back_kb("diamond_menu"))
-
-
-@dp.callback_query(F.data == "diamond_stats")
-async def cb_diamond_stats(callback: CallbackQuery):
-    uid = str(callback.from_user.id)
-    today = datetime.now(timezone.utc).date().isoformat()
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute(
-            "SELECT COALESCE(SUM(amount), 0), COUNT(*) FROM diamond_events "
-            "WHERE owner_id = ? AND event_type = 'claim' AND substr(created_at, 1, 10) = ?",
-            (uid, today),
-        ) as cur:
-            claimed, count = await cur.fetchone()
-    await callback.answer(
-        f"Bugun: {int(claimed or 0)} olmos, {int(count or 0)} ta claim",
-        show_alert=True,
-    )
-
-
-@dp.callback_query(F.data == "diamond_bot_finder")
-async def cb_diamond_bot_finder(callback: CallbackQuery):
-    uid = str(callback.from_user.id)
-    client = userbot_clients.get(uid)
-    if not client:
-        await callback.answer("Avval userbot akkauntini ulang.", show_alert=True)
-        return
-    bots: list[str] = []
-    try:
-        async for dialog in client.iter_dialogs(limit=100):
-            if getattr(dialog.entity, "megagroup", False) or getattr(dialog.entity, "gigagroup", False):
-                async for participant in client.iter_participants(dialog.entity, limit=500):
-                    if getattr(participant, "bot", False):
-                        name = get_display_name(participant)
-                        username = getattr(participant, "username", None)
-                        bots.append(f"• {html.escape(name)} (@{html.escape(username)})" if username else f"• {html.escape(name)}")
-                        if len(bots) >= 30:
-                            break
-    except Exception as exc:
-        log.warning("Bot finder xatosi (%s): %s", uid, exc)
-    text = "🔎 <b>Bot Finder</b>\n" + ("\n".join(dict.fromkeys(bots)) if bots else "Guruhlarda bot topilmadi.")
-    await callback.message.edit_text(text[:4000], reply_markup=back_kb("diamond_menu"))
 
 
 @dp.callback_query(F.data == "profile")
@@ -1601,6 +1521,133 @@ async def cb_profile(callback: CallbackQuery):
         f"👥 Bazadagi userlar: <b>{scraped_count}</b>",
         reply_markup=back_kb("main_menu")
     )
+
+
+@dp.callback_query(F.data == "clock_menu")
+async def cb_clock_menu(callback: CallbackQuery):
+    uid = str(callback.from_user.id)
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT timezone, enabled FROM profile_clock_settings WHERE user_id = ?",
+            (uid,),
+        ) as cur:
+            setting = await cur.fetchone()
+    kb = InlineKeyboardBuilder()
+    for key, (title, _) in CLOCK_ZONES.items():
+        kb.row(InlineKeyboardButton(
+            text=f"{title}{' ✅' if setting and setting[0] == key and setting[1] else ''}",
+            callback_data=f"clock_set:{key}",
+        ))
+    kb.row(InlineKeyboardButton(
+        text="⏱ Soatni o'chirish" if setting and setting[1] else "🕐 Soatni yoqish",
+        callback_data="clock_off" if setting and setting[1] else "clock_on_default",
+    ))
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="main_menu"))
+    status = "faol" if setting and setting[1] else "o'chirilgan"
+    await callback.message.edit_text(
+        f"🕐 <b>Profil soati</b>\nHolat: <b>{status}</b>\n\n"
+        "Davlatni tanlang. Tanlangan soat profil familiyasi oldida har daqiqa yangilanadi.",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@dp.callback_query(F.data.startswith("clock_set:"))
+async def cb_clock_set(callback: CallbackQuery):
+    key = callback.data.split(":", 1)[1]
+    if key not in CLOCK_ZONES:
+        await callback.answer("Davlat topilmadi.", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT INTO profile_clock_settings(user_id, timezone, enabled, clock_font) VALUES (?, ?, 0, 'normal') "
+            "ON CONFLICT(user_id) DO UPDATE SET timezone = excluded.timezone",
+            (str(callback.from_user.id), key),
+        )
+        await db.commit()
+    await callback.message.edit_text(
+        "✍️ <b>Soat shriftini tanlang</b>",
+        reply_markup=get_clock_font_keyboard(key),
+    )
+
+
+def get_clock_font_keyboard(zone: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for key, (title, _) in CLOCK_FONTS.items():
+        preview = format_clock_digits("01;09", key)
+        kb.row(InlineKeyboardButton(
+            text=f"{title} — {preview}",
+            callback_data=f"clock_font:{zone}:{key}",
+        ))
+    kb.row(InlineKeyboardButton(text="⬅️ Davlatlar", callback_data="clock_menu"))
+    return kb.as_markup()
+
+
+@dp.callback_query(F.data.startswith("clock_font:"))
+async def cb_clock_font(callback: CallbackQuery):
+    _, zone, font = callback.data.split(":", 2)
+    if zone not in CLOCK_ZONES or font not in CLOCK_FONTS:
+        await callback.answer("Tanlov topilmadi.", show_alert=True)
+        return
+    uid = str(callback.from_user.id)
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT INTO profile_clock_settings(user_id, timezone, enabled, clock_font) VALUES (?, ?, 1, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET timezone = excluded.timezone, enabled = 1, clock_font = excluded.clock_font",
+            (uid, zone, font),
+        )
+        await db.commit()
+    client = userbot_clients.get(uid)
+    if client:
+        await update_profile_clock(client, uid)
+    await callback.answer("Soat profilga yoqildi.", show_alert=True)
+    await cb_clock_menu(callback)
+
+
+@dp.callback_query(F.data == "clock_on_default")
+async def cb_clock_on_default(callback: CallbackQuery):
+    uid = str(callback.from_user.id)
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT timezone FROM profile_clock_settings WHERE user_id = ?",
+            (uid,),
+        ) as cur:
+            row = await cur.fetchone()
+        zone = row[0] if row else "uzbekistan"
+        await db.execute(
+            "INSERT INTO profile_clock_settings(user_id, timezone, enabled) VALUES (?, ?, 1) "
+            "ON CONFLICT(user_id) DO UPDATE SET enabled = 1",
+            (uid, zone),
+        )
+        await db.commit()
+    await callback.answer("Profil soati yoqildi.", show_alert=True)
+    await cb_clock_menu(callback)
+
+
+@dp.callback_query(F.data == "clock_off")
+async def cb_clock_off(callback: CallbackQuery):
+    uid = str(callback.from_user.id)
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "UPDATE profile_clock_settings SET enabled = 0 WHERE user_id = ?",
+            (uid,),
+        )
+        await db.commit()
+    client = userbot_clients.get(uid)
+    if client:
+        try:
+            full = await client(GetFullUserRequest("me"))
+            async with aiosqlite.connect(DB_FILE) as db:
+                async with db.execute(
+                    "SELECT first_name, last_name FROM profile_clock_names WHERE user_id = ?",
+                    (uid,),
+                ) as cur:
+                    names = await cur.fetchone()
+            if names:
+                await client(UpdateProfileRequest(first_name=names[0], last_name=names[1]))
+        except Exception as exc:
+            log.error("Profile clock disable failed: %s", exc)
+    await callback.answer("Profil soati o'chirildi.", show_alert=True)
+    await cb_clock_menu(callback)
 
 
 @dp.callback_query(F.data == "help")
@@ -1635,48 +1682,6 @@ async def cb_prices(callback: CallbackQuery):
         if FREE_MODE else "💰 Tariflar haqida ma'lumot olish uchun yordamga murojaat qiling."
     )
     await callback.message.edit_text(text, reply_markup=back_kb("main_menu"))
-
-
-@dp.callback_query(F.data.in_({"raid_panel", "ban_panel"}))
-async def cb_raid_panel(callback: CallbackQuery, state: FSMContext):
-    if is_clone_bot():
-        await callback.answer("Raid clone botda mavjud emas.", show_alert=True)
-        return
-    uid = str(callback.from_user.id)
-    if not await user_has_raid_access(uid):
-        await callback.message.edit_reply_markup(
-            reply_markup=await get_user_main_keyboard(uid)
-        )
-        await callback.answer("Raid panel uchun owner ruxsati kerak.", show_alert=True)
-        return
-
-    await callback.message.edit_text(
-        "Ban qilinadigan user username yoki ID sini yuboring."
-    )
-    await state.set_state(UserStatesGroup.ban_target_input)
-    await callback.answer()
-
-
-@dp.message(StateFilter(UserStatesGroup.ban_target_input), F.chat.type == "private", F.text)
-async def ban_target_input(message: Message, state: FSMContext):
-    if not await user_has_raid_access(message.from_user.id):
-        await state.clear()
-        return
-    target = message.text.strip()
-    if target.startswith((".ban", "/ban", ".mban", "/mban")):
-        parts = target.split(maxsplit=1)
-        target = parts[1].strip() if len(parts) == 2 else ""
-    target = target.lstrip("@")
-    if not target or (not target.isdigit() and not re.fullmatch(r"[A-Za-z0-9_]{5,32}", target)):
-        await message.answer("Username yoki Telegram ID ni to'g'ri yuboring.")
-        return
-    await state.clear()
-    await message.answer("⏳ Ban barcha owner tanlagan guruhlarga yuborilmoqda...")
-    await run_owner_command_raid(
-        message.from_user.id,
-        int(target) if target.isdigit() else f"@{target}",
-        message.chat.id,
-    )
 
 
 def get_raid_panel_keyboard(delay: float, batch_size: int) -> InlineKeyboardMarkup:
@@ -1826,25 +1831,21 @@ async def cb_set_utag_speed(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "settings_buy_pro")
 async def cb_buy_pro(callback: CallbackQuery):
-    if FREE_MODE:
-        await callback.message.edit_text(
-            "🆓 <b>To'liq bepul rejim</b>\n\n"
-            "Bot funksiyalaridan foydalanish uchun VIP yoki to'lov talab qilinmaydi.",
-            reply_markup=back_kb("btn_settings")
-        )
-        return
+    price = await get_pro_price()
     text = (
         "💳 <b>PRO Tarif Sotib Olish</b>\n\n"
-        "✅ Reklamasiz uTag\n"
-        "✅ Bio da reklama yo'q\n"
-        "✅ Barcha funksiyalar cheksiz\n\n"
-        "💰 Narx: <b>2,000 UZS</b> (3 kunlik)\n\n"
-        f"To'lov uchun: {ADMIN_USERNAME} ga murojaat qiling"
+        "✅ uTag uchun reklama yo'q\n"
+        "✅ Avto xabarda kunlik 150 ta limit yo'q\n"
+        "✅ User terishda kunlik 500 ta limit yo'q\n"
+        "✅ Avto javob, bio va boshqa PRO funksiyalari\n"
+        "✅ Barcha tegishli sozlamalarda cheksiz foydalanish\n\n"
+        f"💰 Narx: <b>{price} Telegram Stars</b>\n"
+        "PRO muddat: <b>30 kun</b>"
     )
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(
-        text="💳 To'lov qilish",
-        url=f"https://t.me/{ADMIN_USERNAME.replace('@','')}"
+        text=f"⭐ {price} Stars bilan sotib olish",
+        callback_data="buy_pro_stars",
     ))
     kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="btn_settings"))
     await callback.message.edit_text(text, reply_markup=kb.as_markup())
@@ -1864,50 +1865,80 @@ async def get_clone_price() -> int:
         return 100
 
 
-@dp.callback_query(F.data == "clone_buy")
-async def cb_clone_buy(callback: CallbackQuery, state: FSMContext):
-    if is_clone_bot():
-        await callback.answer("Klon sotib olish faqat asosiy bot orqali mumkin.", show_alert=True)
-        return
-    if not CLONE_TOKEN_ENCRYPTION_KEY:
-        await callback.answer("Klon sotib olish hozircha mavjud emas.", show_alert=True)
-        return
-    price = await get_clone_price()
+async def get_pro_price() -> int:
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT value FROM bot_settings WHERE key = 'pro_price_stars'"
+        ) as cur:
+            row = await cur.fetchone()
+    try:
+        return max(1, min(int(row[0]), 100000)) if row else 100
+    except (TypeError, ValueError):
+        return 100
+
+
+@dp.callback_query(F.data == "buy_pro_stars")
+async def cb_buy_pro_stars(callback: CallbackQuery):
+    price = await get_pro_price()
     order_id = os.urandom(12).hex()
-    payload = f"clone:{callback.from_user.id}:{order_id}"
-    status = "paid" if price == 0 else "pending"
+    payload = f"pro:{callback.from_user.id}:{order_id}"
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(
-            "INSERT INTO clone_orders (id, user_id, payload, amount, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (order_id, str(callback.from_user.id), payload, price, status,
-             datetime.now(timezone.utc).isoformat())
+            "INSERT INTO paid_feature_orders "
+            "(id, user_id, payload, feature, amount, status, created_at) "
+            "VALUES (?, ?, ?, 'pro', ?, 'pending', ?)",
+            (order_id, str(callback.from_user.id), payload, price,
+             datetime.now(timezone.utc).isoformat()),
         )
         await db.commit()
-    if price == 0:
-        await state.update_data(clone_order_id=order_id)
-        await state.set_state(UserStatesGroup.clone_token_input)
-        await callback.message.answer(
-            "Klon bepul. @BotFather orqali bot yarating va uning tokenini shu yerga yuboring. "
-            "Token shifrlangan holda saqlanadi va qayta ko'rsatilmaydi."
-        )
-        await callback.answer()
-        return
     await callback.message.answer_invoice(
-        title="Shaxsiy Telegram bot",
-        description="Bot nusxangizni umumiy tizimga ulash.",
+        title="PRO tarif",
+        description="30 kunlik PRO tarif. To'lov bot egasining Telegram Stars hisobiga tushadi.",
         payload=payload,
         provider_token="",
         currency="XTR",
-        prices=[LabeledPrice(label="Bot nusxasi", amount=price)],
-        start_parameter="create-clone",
+        prices=[LabeledPrice(label="30 kunlik PRO", amount=price)],
+        start_parameter="buy-pro",
     )
     await callback.answer()
 
 
 @dp.pre_checkout_query()
 async def pre_checkout_clone(query: types.PreCheckoutQuery):
-    if is_clone_bot() or not query.invoice_payload.startswith("clone:") or query.currency != "XTR":
+    if is_clone_bot() or query.currency != "XTR":
+        await query.answer(ok=False, error_message="To'lov ma'lumotlari noto'g'ri.")
+        return
+    if query.invoice_payload.startswith("pro:"):
+        async with aiosqlite.connect(DB_FILE) as db:
+            async with db.execute(
+                "SELECT user_id, amount, status FROM paid_feature_orders WHERE payload = ?",
+                (query.invoice_payload,),
+            ) as cur:
+                order = await cur.fetchone()
+        valid = bool(
+            order
+            and order[0] == str(query.from_user.id)
+            and order[1] == query.total_amount
+            and order[2] == "pending"
+        )
+        await query.answer(ok=valid, error_message=None if valid else "Buyurtma topilmadi yoki ishlatilgan.")
+        return
+    if query.invoice_payload.startswith("member_add:"):
+        async with aiosqlite.connect(DB_FILE) as db:
+            async with db.execute(
+                "SELECT user_id, amount, status FROM paid_feature_orders WHERE payload = ?",
+                (query.invoice_payload,),
+            ) as cur:
+                order = await cur.fetchone()
+        valid = bool(
+            order
+            and order[0] == str(query.from_user.id)
+            and order[1] == query.total_amount
+            and order[2] == "pending"
+        )
+        await query.answer(ok=valid, error_message=None if valid else "Buyurtma topilmadi yoki ishlatilgan.")
+        return
+    if not query.invoice_payload.startswith("clone:"):
         await query.answer(ok=False, error_message="To'lov ma'lumotlari noto'g'ri.")
         return
     async with aiosqlite.connect(DB_FILE) as db:
@@ -1934,98 +1965,74 @@ async def clone_payment_success(message: Message, state: FSMContext):
     if payment.currency != "XTR":
         await message.answer("To'lovni tekshirib bo'lmadi. Bot egasiga murojaat qiling.")
         return
-    async with aiosqlite.connect(DB_FILE) as db:
-        cursor = await db.execute(
-            "UPDATE clone_orders SET status = 'paid', telegram_charge_id = ? "
-            "WHERE payload = ? AND user_id = ? AND amount = ? AND status = 'pending'",
-            (payment.telegram_payment_charge_id, payment.invoice_payload,
-             str(message.from_user.id), payment.total_amount)
-        )
-        await db.commit()
-    if cursor.rowcount != 1:
-        await message.answer("Buyurtma topilmadi yoki to'lov avval qayta ishlangan.")
-        return
-    order_id = payment.invoice_payload.rsplit(":", 1)[-1]
-    await state.update_data(clone_order_id=order_id)
-    await state.set_state(UserStatesGroup.clone_token_input)
-    await message.answer(
-        "To'lov qabul qilindi. @BotFather orqali bot yarating va uning tokenini shu yerga yuboring. "
-        "Token shifrlangan holda saqlanadi va qayta ko'rsatilmaydi.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="Sozlashni davom ettirish", callback_data="clone_continue")
-        ]])
-    )
-
-
-@dp.callback_query(F.data == "clone_continue")
-async def cb_clone_continue(callback: CallbackQuery, state: FSMContext):
-    if is_clone_bot():
-        await callback.answer("Klon sozlash faqat asosiy botda mumkin.", show_alert=True)
-        return
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute(
-            "SELECT id FROM clone_orders WHERE user_id = ? AND status = 'paid' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (str(callback.from_user.id),)
-        ) as cur:
-            order = await cur.fetchone()
-    if not order:
-        await callback.answer("Sozlash kutilayotgan to'langan buyurtma topilmadi.", show_alert=True)
-        return
-    await state.update_data(clone_order_id=order[0])
-    await state.set_state(UserStatesGroup.clone_token_input)
-    await callback.message.answer("@BotFather orqali yaratilgan bot tokenini yuboring.")
-    await callback.answer()
-
-
-@dp.message(StateFilter(UserStatesGroup.clone_token_input), F.text)
-async def clone_token_input(message: Message, state: FSMContext):
-    if is_clone_bot():
-        await message.answer("Klon bot qo'shish faqat asosiy botda mumkin.")
-        return
-    token = message.text.strip()
-    order_id = (await state.get_data()).get("clone_order_id")
-    if not order_id:
-        await state.clear()
-        await message.answer("To'langan buyurtma topilmadi. Klon sotib olishni qaytadan oching.")
-        return
-    if token == BOT_TOKEN:
-        await message.answer("Asosiy bot tokenini ulab bo'lmaydi. Boshqa bot tokenini yuboring.")
-        return
-    try:
-        encrypted_token = clone_token_cipher().encrypt(token.encode()).decode()
-        candidate = Bot(token=token)
-        try:
-            me = await candidate.get_me()
-        finally:
-            await candidate.session.close()
-    except (ValueError, InvalidToken, RuntimeError):
-        await message.answer("Token noto'g'ri. @BotFather orqali tekshirib, qayta yuboring.")
-        return
-    except Exception:
-        await message.answer("Tokenni tekshirib bo'lmadi. Tekshirib, qayta urinib ko'ring.")
-        return
-    if not me.username:
-        await message.answer("Bot username'ga ega bo'lishi kerak. @BotFather'da sozlab, qayta urinib ko'ring.")
-        return
-    try:
+    if payment.invoice_payload.startswith("pro:"):
         async with aiosqlite.connect(DB_FILE) as db:
-            await db.execute(
-                "INSERT INTO cloned_bots (bot_id, owner_id, username, token_encrypted, order_id, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (str(me.id), str(message.from_user.id), me.username, encrypted_token, order_id,
-                 datetime.now(timezone.utc).isoformat())
+            cursor = await db.execute(
+                "UPDATE paid_feature_orders SET status = 'paid', telegram_charge_id = ? "
+                "WHERE payload = ? AND user_id = ? AND amount = ? AND status = 'pending'",
+                (payment.telegram_payment_charge_id, payment.invoice_payload,
+                 str(message.from_user.id), payment.total_amount),
             )
-            await db.execute("UPDATE clone_orders SET status = 'provisioned' WHERE id = ?", (order_id,))
             await db.commit()
-    except aiosqlite.IntegrityError:
-        await message.answer("Bu bot allaqachon ulangan yoki buyurtma ishlatilgan.")
+        if cursor.rowcount != 1:
+            await message.answer("PRO buyurtmasi topilmadi yoki to'lov qayta ishlangan.")
+            return
+    if payment.invoice_payload.startswith("member_add:"):
+        parts = payment.invoice_payload.split(":")
+        if len(parts) != 4:
+            await message.answer("A'zo qo'shish to'lovi noto'g'ri.")
+            return
+        _, uid_text, package_count_text, _ = parts
+        async with aiosqlite.connect(DB_FILE) as db:
+            cursor = await db.execute(
+                "UPDATE paid_feature_orders SET status = 'paid', telegram_charge_id = ? "
+                "WHERE payload = ? AND user_id = ? AND amount = ? AND status = 'pending'",
+                (payment.telegram_payment_charge_id, payment.invoice_payload,
+                 str(message.from_user.id), payment.total_amount),
+            )
+            if cursor.rowcount != 1:
+                await db.rollback()
+                await message.answer("A'zo qo'shish buyurtmasi topilmadi yoki avval ishlatilgan.")
+                return
+            package_count = int(package_count_text)
+            await db.execute(
+                "INSERT INTO member_add_credits(owner_id, remaining_count) VALUES (?, ?) "
+                "ON CONFLICT(owner_id) DO UPDATE "
+                "SET remaining_count = remaining_count + excluded.remaining_count",
+                (uid_text, package_count),
+            )
+            await db.commit()
+        await message.answer(
+            f"✅ To'lov qabul qilindi.\n"
+            f"👥 Hisobingizga {package_count:,} a'zo qo'shish krediti qo'shildi."
+        )
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"⭐ A'zo qo'shish to'lovi: {payment.total_amount} Stars\n"
+                f"User ID: <code>{uid_text}</code>\n"
+                f"Kredit: <b>{int(package_count_text):,}</b>",
+            )
+        except Exception as exc:
+            log.warning("Ownerga member-add bildirgisi yuborilmadi: %s", exc)
         return
-    await state.clear()
-    start_registered_clone(str(me.id), int(message.from_user.id), me.username, token)
-    await message.answer(
-        f"Tayyor. @{html.escape(me.username)} ulandi. Egasi paneli /admin buyrug'i orqali ochiladi."
-    )
+        await grant_pro(str(message.from_user.id), 30)
+        await message.answer(
+            "✅ To'lov qabul qilindi!\n"
+            "💎 Sizga 30 kunlik PRO tarif faollashtirildi."
+        )
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"⭐ Yangi PRO to'lovi: {payment.total_amount} Stars\n"
+                f"User ID: <code>{message.from_user.id}</code>\n"
+                f"Charge: <code>{payment.telegram_payment_charge_id}</code>",
+            )
+        except Exception as exc:
+            log.warning("Ownerga to'lov bildirishi yuborilmadi: %s", exc)
+        return
+    await message.answer("Bot klonini yaratish funksiyasi o'chirilgan.")
+
 
 @dp.callback_query(F.data == "settings_my_ref")
 async def cb_my_ref(callback: CallbackQuery):
@@ -2043,13 +2050,6 @@ async def cb_my_ref(callback: CallbackQuery):
 # ─────────────────────────────────────────────
 @dp.callback_query(F.data == "btn_pro_info")
 async def cb_pro_info(callback: CallbackQuery):
-    if FREE_MODE:
-        await callback.message.edit_text(
-            "🆓 <b>To'liq bepul rejim</b>\n\n"
-            "Barcha mavjud bot funksiyalaridan foydalanish uchun VIP yoki to'lov kerak emas.",
-            reply_markup=back_kb("main_menu")
-        )
-        return
     uid = str(callback.from_user.id)
     username = _active_bot_username.get() or bot_username
     async with aiosqlite.connect(DB_FILE) as db:
@@ -2068,10 +2068,12 @@ async def cb_pro_info(callback: CallbackQuery):
         f"💠 <b>PRO Tarif Ma'lumotlari</b>\n\n"
         f"Holatingiz: <b>{status}</b>\n"
         f"Chaqirgan do'stlar: <b>{ref_count} ta</b>\n\n"
-        f"📌 <b>PRO imkoniyati:</b> Tag ostidagi reklama matni olib tashlanadi!\n\n"
-        f"💡 <b>PRO olish:</b>\n"
-        f"1️⃣ <b>3 ta do'st taklif qiling</b> → Avto 3 kunlik PRO\n"
-        f"2️⃣ <b>Karta orqali:</b> 2,000 UZS (3 kunlik)\n\n"
+        "📌 <b>PRO imkoniyatlari:</b>\n"
+        "✅ Avto xabar kunlik 150 ta limitidan ozod\n"
+        "✅ User terish kunlik 500 ta limitidan ozod\n"
+        "✅ uTag, avto javob va bio'dagi reklama yo'q\n"
+        "✅ Barcha PRO funksiyalari cheksiz\n\n"
+        "💎 PRO sotib olish yoki referal orqali 3 kunlik PRO olish mumkin.\n\n"
         f"🔗 Referal havolangiz:\n<code>https://t.me/{username}?start={uid}</code>"
     )
     kb = InlineKeyboardBuilder()
@@ -2552,32 +2554,30 @@ async def do_utag(client: TelegramClient, uid: str, event, random_mode: bool = F
         participants = await client.get_participants(chat, limit=500)
         me = await client.get_me()
         delay = await get_utag_delay(uid)
-        custom_emojis = await get_custom_emoji_pack(client) if random_mode else []
         random_words = await get_group_random_words(client, chat) if random_mode else None
         tagged = 0
         seen_user_ids: set[int] = set()
-        batch_texts: list[str] = []
-        batch_entities: list[MessageEntityCustomEmoji | MessageEntityMentionName] = []
 
-        async def flush_batch():
-            nonlocal tagged, batch_texts, batch_entities
-            if not batch_texts:
-                return
-            text = "\n".join(batch_texts)
+        async def send_member_tag(
+            text: str,
+            entities: list[MessageEntityCustomEmoji | MessageEntityMentionName],
+        ):
+            nonlocal tagged
             while True:
                 try:
                     await client.send_message(
                         chat,
                         text,
-                        formatting_entities=batch_entities or None,
+                        formatting_entities=entities or None,
                         parse_mode=None,
                     )
+                    tagged += 1
                     break
                 except FloodWaitError as exc:
                     await asyncio.sleep(exc.seconds + 1)
                 except (PremiumAccountRequiredError, EntityBoundsInvalidError):
                     mention_entities = [
-                        entity for entity in batch_entities
+                        entity for entity in entities
                         if isinstance(entity, MessageEntityMentionName)
                     ]
                     while True:
@@ -2588,18 +2588,16 @@ async def do_utag(client: TelegramClient, uid: str, event, random_mode: bool = F
                                 formatting_entities=mention_entities or None,
                                 parse_mode=None,
                             )
+                            tagged += 1
                             break
                         except FloodWaitError as exc:
                             await asyncio.sleep(exc.seconds + 1)
                     break
-            tagged += len(batch_texts)
-            batch_texts = []
-            batch_entities = []
 
         for user in participants:
             if uid not in _utag_tasks or _utag_tasks[uid].done():
                 break  # To'xtatildi
-            if user.id == me.id or user.bot:
+            if user.id == me.id:
                 continue
             user_id = int(user.id)
             if user_id in seen_user_ids:
@@ -2607,36 +2605,14 @@ async def do_utag(client: TelegramClient, uid: str, event, random_mode: bool = F
             seen_user_ids.add(user_id)
             try:
                 if random_mode:
-                    custom_emoji = random.choice(custom_emojis) if custom_emojis else None
                     tag_text, entities = make_random_utag_text(
-                        user, custom_emoji, random_words
+                        user, random_words=random_words
                     )
                 else:
-                    username = getattr(user, "username", None)
-                    mention = f"@{username}" if username else (
-                        get_display_name(user).replace("#", "").strip() or "do'stimiz"
-                    )
+                    mention = get_user_mention_name(user)
                     tag_text = make_text_unique(mention)
-                    entities = [] if username else [MessageEntityMentionName(
-                        offset=0,
-                        length=utf16_length(mention),
-                        user_id=user.id,
-                    )]
-                entity_offset = sum(utf16_length(item) for item in batch_texts) + len(batch_texts)
-                batch_texts.append(tag_text)
-                for entity in entities:
-                    if isinstance(entity, MessageEntityCustomEmoji):
-                        batch_entities.append(MessageEntityCustomEmoji(
-                            offset=entity_offset + entity.offset,
-                            length=entity.length,
-                            document_id=entity.document_id,
-                        ))
-                    else:
-                        batch_entities.append(MessageEntityMentionName(
-                            offset=entity_offset + entity.offset,
-                            length=entity.length,
-                            user_id=entity.user_id,
-                        ))
+                    entities = get_user_mention_entities(user, mention)
+                await send_member_tag(tag_text, entities)
             except FloodWaitError as e:
                 await asyncio.sleep(e.seconds + 5)
             except (UserPrivacyRestrictedError, PeerFloodError):
@@ -2644,11 +2620,8 @@ async def do_utag(client: TelegramClient, uid: str, event, random_mode: bool = F
             except Exception as e:
                 log.error(f"Tag xatosi: {e}")
                 continue
-            if len(batch_texts) >= 20:
-                await flush_batch()
-                await asyncio.sleep(delay)
+            await asyncio.sleep(delay)
 
-        await flush_batch()
 
         # Jarayon tugadi yoki to'xtatildi — reklama (pro bo'lmasa)
         if not pro:
@@ -2688,49 +2661,9 @@ async def register_userbot_handlers(client: TelegramClient, uid: str):
     @client.on(events.NewMessage(incoming=True))
     async def on_incoming_message(event):
         """Offline paytda kelgan shaxsiy xabarga sozlangan javobni yuboradi."""
-        sender = await event.get_sender()
-        raw_text = event.raw_text or ""
-        if getattr(sender, "bot", False) and re.search(r"(diamond|olmos|gift|reward|mukofot)", raw_text, re.I):
-            async with aiosqlite.connect(DB_FILE) as db:
-                async with db.execute(
-                    "SELECT enabled, auto_claim FROM diamond_settings WHERE owner_id = ?", (uid,)
-                ) as cur:
-                    diamond = await cur.fetchone()
-            if diamond and diamond[0]:
-                amount_match = re.search(r"(\d[\d\s]*)\s*(?:💎|olmos|diamond)", raw_text, re.I)
-                amount = int(re.sub(r"\s", "", amount_match.group(1))) if amount_match else 0
-                source = f"@{sender.username}" if getattr(sender, "username", None) else str(sender.id)
-                async with aiosqlite.connect(DB_FILE) as db:
-                    await db.execute(
-                        "INSERT INTO diamond_events "
-                        "(owner_id, chat_id, source_username, event_type, amount, details, created_at) "
-                        "VALUES (?, ?, ?, 'notification', ?, ?, ?)",
-                        (uid, str(event.chat_id), source, amount, raw_text[:500], datetime.now(timezone.utc).isoformat()),
-                    )
-                    await db.commit()
-                username = (getattr(sender, "username", "") or "").lower()
-                official_source = any(token in username for token in ("official", "gift", "diamond", "hub"))
-                if diamond[1] and official_source and event.buttons:
-                    for row in event.buttons:
-                        for button in row:
-                            if re.search(r"(claim|olish|olmo[s'’]?|get reward)", getattr(button, "text", ""), re.I):
-                                try:
-                                    await button.click()
-                                    async with aiosqlite.connect(DB_FILE) as db:
-                                        await db.execute(
-                                            "INSERT INTO diamond_events "
-                                            "(owner_id, chat_id, source_username, event_type, amount, details, created_at) "
-                                            "VALUES (?, ?, ?, 'claim', ?, ?, ?)",
-                                            (uid, str(event.chat_id), source, amount,
-                                             "Rasmiy ko'rinadigan Claim tugmasi bosildi.",
-                                             datetime.now(timezone.utc).isoformat()),
-                                        )
-                                        await db.commit()
-                                except Exception as exc:
-                                    log.warning("Diamond claim xatosi (%s): %s", uid, exc)
-                                break
         if not event.is_private or not event.raw_text:
             return
+        sender = await event.get_sender()
         if not sender or getattr(sender, "bot", False) or getattr(sender, "id", None) is None:
             return
 
@@ -2875,6 +2808,83 @@ async def register_userbot_handlers(client: TelegramClient, uid: str):
 # ─────────────────────────────────────────────
 # AVTO XABAR
 # ─────────────────────────────────────────────
+def serialize_message_entities(message: Message) -> list[dict[str, object]]:
+    entities = getattr(message, "entities", None) or []
+    return [
+        entity.model_dump(exclude_none=True)
+        for entity in entities
+        if getattr(entity, "type", None)
+    ]
+
+
+async def build_telethon_message_entities(
+    client: TelegramClient,
+    entities_data: list[dict[str, object]],
+) -> list:
+    entity_types = {
+        "bold": MessageEntityBold,
+        "italic": MessageEntityItalic,
+        "underline": MessageEntityUnderline,
+        "strikethrough": MessageEntityStrike,
+        "code": MessageEntityCode,
+        "pre": MessageEntityPre,
+        "spoiler": MessageEntitySpoiler,
+        "blockquote": MessageEntityBlockquote,
+        "mention": MessageEntityMention,
+    }
+    result = []
+    custom_ids: list[int] = []
+
+    for entity_data in entities_data:
+        entity_type = str(entity_data.get("type", ""))
+        offset = int(entity_data.get("offset", 0))
+        length = int(entity_data.get("length", 0))
+        if entity_type in entity_types:
+            result.append(entity_types[entity_type](offset=offset, length=length))
+        elif entity_type == "text_link":
+            url = str(entity_data.get("url", "")).strip()
+            if url:
+                result.append(MessageEntityTextUrl(offset=offset, length=length, url=url))
+        elif entity_type == "custom_emoji":
+            try:
+                document_id = int(str(entity_data.get("custom_emoji_id", "")))
+                custom_ids.append(document_id)
+                result.append(
+                    MessageEntityCustomEmoji(
+                        offset=offset,
+                        length=length,
+                        document_id=document_id,
+                    )
+                )
+            except (TypeError, ValueError):
+                continue
+
+    return result
+
+
+async def get_auto_message_daily_usage(uid: str) -> int:
+    usage_date = datetime.now(timezone.utc).date().isoformat()
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT sent_count FROM auto_message_daily_usage "
+            "WHERE owner_id = ? AND usage_date = ?",
+            (uid, usage_date),
+        ) as cur:
+            row = await cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def add_auto_message_daily_usage(uid: str, sent_count: int) -> None:
+    usage_date = datetime.now(timezone.utc).date().isoformat()
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("""
+            INSERT INTO auto_message_daily_usage (owner_id, usage_date, sent_count)
+            VALUES (?, ?, ?)
+            ON CONFLICT(owner_id, usage_date)
+            DO UPDATE SET sent_count = sent_count + excluded.sent_count
+        """, (uid, usage_date, sent_count))
+        await db.commit()
+
 @dp.callback_query(F.data == "btn_auto_msg")
 async def cb_auto_msg_menu(callback: CallbackQuery, state: FSMContext):
     uid = str(callback.from_user.id)
@@ -2890,7 +2900,10 @@ async def cb_auto_msg_menu(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(StateFilter(UserStatesGroup.auto_msg_text), F.text)
 async def auto_msg_text_input(message: Message, state: FSMContext):
-    await state.update_data(auto_text=message.text)
+    await state.update_data(
+        auto_text=message.text,
+        auto_entities=serialize_message_entities(message),
+    )
     await message.answer(
         "📋 Endi foydalanuvchi usernamlarini kiriting (har birini yangi qatordan):\n"
         "Masalan:\n@user1\n@user2",
@@ -2902,6 +2915,7 @@ async def auto_msg_text_input(message: Message, state: FSMContext):
 async def auto_msg_send(message: Message, state: FSMContext):
     data = await state.get_data()
     text = data.get("auto_text", "")
+    entities_data = data.get("auto_entities", [])
     uid  = str(message.from_user.id)
     client = userbot_clients.get(uid)
     if not client:
@@ -2910,6 +2924,24 @@ async def auto_msg_send(message: Message, state: FSMContext):
         return
 
     usernames = [username.strip() for username in message.text.splitlines() if username.strip()]
+    username_keys = list(dict.fromkeys(usernames))
+    has_pro = await user_has_active_pro(uid)
+    if has_pro:
+        usernames = username_keys
+    else:
+        usernames = username_keys[:150]
+        used_today = await get_auto_message_daily_usage(uid)
+        remaining = max(0, 150 - used_today)
+        usernames = usernames[:remaining]
+    if not usernames:
+        await message.answer(
+            "❌ Bugungi 150 ta avto xabar limiti tugagan.\n"
+            "Yangi kun 00:00 UTC'da tiklanadi yoki PRO sotib oling.",
+            reply_markup=get_limit_reached_keyboard(),
+        )
+        await state.clear()
+        return
+    formatting_entities = await build_telethon_message_entities(client, entities_data)
     progress_message = await message.answer(
         f"⏳ {len(usernames)} ta foydalanuvchiga xabar yuborilmoqda..."
     )
@@ -2921,9 +2953,13 @@ async def auto_msg_send(message: Message, state: FSMContext):
     for index, username in enumerate(usernames, start=1):
         while True:
             try:
-                await client.send_message(username, text, parse_mode=None)
+                await client.send_message(
+                    username,
+                    text,
+                    formatting_entities=formatting_entities or None,
+                    parse_mode=None,
+                )
                 sent += 1
-                await asyncio.sleep(2)
                 break
             except FloodWaitError as exc:
                 await progress_message.edit_text(
@@ -2949,6 +2985,8 @@ async def auto_msg_send(message: Message, state: FSMContext):
                 f"⏳ Jarayon: {index}/{len(usernames)} | yuborildi: {sent} | xato: {failed}"
             )
 
+    if sent and not await user_has_active_pro(uid):
+        await add_auto_message_daily_usage(uid, sent)
     await message.answer(
         f"✅ Yuborildi: <b>{sent}</b>\n❌ Muvaffaqiyatsiz: <b>{failed}</b>\n"
         f"⏭ Yuborilmay qoldi: <b>{not_processed}</b>"
@@ -3156,20 +3194,46 @@ def get_scrape_groups_keyboard(uid: str) -> InlineKeyboardMarkup:
             text=f"👥 {title[:42]}",
             callback_data=f"scrape_group:{key}"
         ))
+    kb.row(InlineKeyboardButton(
+        text="🔗 Guruh havolasini yuborish",
+        callback_data="scrape_group_link",
+    ))
     kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="main_menu"))
     return kb.as_markup()
 
 
 def get_scrape_count_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    buttons = [
-        InlineKeyboardButton(text=f"👥 {count}", callback_data=f"scrape_count:{count}")
-        for count in (100, 200, 500, 1000, 1500)
-    ]
-    kb.row(*buttons[:3])
-    kb.row(*buttons[3:])
+    kb.row(
+        InlineKeyboardButton(text="👥 500", callback_data="scrape_count:500"),
+        InlineKeyboardButton(text="📊 Kunlik limit: 500", callback_data="scrape_limit_info"),
+    )
     kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="btn_scrape"))
     return kb.as_markup()
+
+
+async def get_scrape_daily_usage(uid: str) -> int:
+    usage_date = datetime.now(timezone.utc).date().isoformat()
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT scraped_count FROM scrape_daily_usage "
+            "WHERE owner_id = ? AND usage_date = ?",
+            (uid, usage_date),
+        ) as cur:
+            row = await cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def add_scrape_daily_usage(uid: str, count: int) -> None:
+    usage_date = datetime.now(timezone.utc).date().isoformat()
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("""
+            INSERT INTO scrape_daily_usage (owner_id, usage_date, scraped_count)
+            VALUES (?, ?, ?)
+            ON CONFLICT(owner_id, usage_date)
+            DO UPDATE SET scraped_count = scraped_count + excluded.scraped_count
+        """, (uid, usage_date, count))
+        await db.commit()
 
 
 def get_scrape_mode_keyboard() -> InlineKeyboardMarkup:
@@ -3228,6 +3292,50 @@ async def cb_scrape_menu(callback: CallbackQuery, state: FSMContext):
     )
 
 
+@dp.callback_query(F.data == "scrape_group_link")
+async def cb_scrape_group_link(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "🔗 Guruh havolasini yoki public username ni yuboring:\n\n"
+        "<code>https://t.me/guruh</code>\n"
+        "<code>@guruh</code>",
+    )
+    await state.set_state(UserStatesGroup.scrape_group_link)
+    await callback.answer()
+
+
+@dp.message(StateFilter(UserStatesGroup.scrape_group_link), F.text)
+async def scrape_group_link_input(message: Message, state: FSMContext):
+    uid = str(message.from_user.id)
+    client = userbot_clients.get(uid)
+    if not client:
+        await message.answer("❌ Avval akkaunt ulang.")
+        return
+
+    raw_link = message.text.strip()
+    try:
+        entity = await client.get_entity(raw_link)
+        if not (
+            isinstance(entity, Chat)
+            or getattr(entity, "megagroup", False)
+        ):
+            await message.answer("❌ Bu guruh yoki superguruh havolasi emas.")
+            return
+        title = get_display_name(entity).strip() or raw_link
+        key = f"link_{len(_scrape_group_choices.setdefault(uid, {}))}"
+        _scrape_group_choices.setdefault(uid, {})[key] = {
+            "entity": entity,
+            "title": title,
+        }
+        await state.update_data(scrape_group_key=key)
+        await message.answer(
+            f"✅ Tanlandi: <b>{html.escape(title)}</b>\n\nTerish boshlandi..."
+        )
+        await run_scrape_for_count(message, state, uid, None, "fast")
+    except Exception as exc:
+        log.warning("Scrape group havolasi topilmadi (%s): %s", uid, exc)
+        await message.answer("❌ Guruh topilmadi yoki akkaunt guruhga a'zo emas.")
+
+
 @dp.callback_query(F.data.startswith("scrape_group:"))
 async def cb_scrape_group_selected(callback: CallbackQuery, state: FSMContext):
     uid = str(callback.from_user.id)
@@ -3239,10 +3347,10 @@ async def cb_scrape_group_selected(callback: CallbackQuery, state: FSMContext):
     await state.update_data(scrape_group_key=key)
     await callback.message.edit_text(
         f"✅ Tanlandi: <b>{html.escape(str(choice['title']))}</b>\n\n"
-        "Terish usulini tanlang:",
-        reply_markup=get_scrape_mode_keyboard()
+        "Guruhdagi barcha a'zolar terilmoqda..."
     )
-    await state.set_state(UserStatesGroup.scrape_mode)
+    await callback.answer()
+    await run_scrape_for_count(callback.message, state, uid, None, "fast")
 
 
 @dp.callback_query(F.data.startswith("scrape_mode:"))
@@ -3250,24 +3358,37 @@ async def cb_scrape_mode(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id <= 0 or callback.message is None:
         await callback.answer("❌ So'rovni bajarib bo'lmadi.", show_alert=True)
         return
+    uid = str(callback.from_user.id)
     mode = callback.data.split(":", 1)[1]
     if mode not in {"fast", "slow"}:
         await callback.answer("❌ Noto'g'ri rejim.", show_alert=True)
         return
     await state.update_data(scrape_mode=mode)
-    await state.set_state(UserStatesGroup.scrape_count)
     mode_label = "Tez" if mode == "fast" else "Sekin"
+    await callback.answer(f"{mode_label} terish boshlandi")
+    await state.set_state(UserStatesGroup.scrape_count)
     await callback.message.edit_text(
-        f"⚙️ Rejim: <b>{mode_label} terish</b>\n\n"
-        "Nechta foydalanuvchi yig'ish kerak? 100, 200, 500, 1000 yoki 1500 ni tanlang:",
-        reply_markup=get_scrape_count_keyboard()
+        f"📊 <b>{mode_label} terish</b>\n\nNechta obunachi yig'ilsin?",
+        reply_markup=get_scrape_count_keyboard(),
     )
-    await callback.answer()
 
 
 async def run_scrape_for_count(
-    message: Message, state: FSMContext, uid: str, count: int, mode: str
+    message: Message, state: FSMContext, uid: str, count: int | None, mode: str
 ):
+    has_pro = await user_has_active_pro(uid)
+    used_today = await get_scrape_daily_usage(uid)
+    remaining = 500 - used_today
+    if not has_pro and remaining <= 0:
+        await message.answer(
+            "❌ Bugungi 500 ta user terish limiti tugagan.\n"
+            "Limit 24 soatdan keyin tiklanadi yoki PRO sotib oling.",
+            reply_markup=get_limit_reached_keyboard(),
+        )
+        await state.clear()
+        return
+    if not has_pro and (count is None or count > remaining):
+        count = remaining
     client = userbot_clients.get(uid)
     data = await state.get_data()
     choice = _scrape_group_choices.get(uid, {}).get(data.get("scrape_group_key", ""))
@@ -3277,31 +3398,168 @@ async def run_scrape_for_count(
         return
 
     group = choice["entity"]
+    try:
+        group = await client.get_entity(group)
+    except Exception as exc:
+        log.warning("Guruh entity yangilanmadi (%s): %s", uid, exc)
     group_title = str(choice["title"])
-    message_limit = 1000 if mode == "fast" else None
-    mode_label = "tez" if mode == "fast" else "sekin"
-    await message.answer(
-        f"⏳ <b>{html.escape(group_title)}</b> guruhidagi xabarlar {mode_label} rejimda tahlil qilinmoqda..."
+    mode_label = "avtomatik"
+    status = await message.answer(
+        f"⏳ <b>{html.escape(group_title)}</b> guruhidagi barcha mavjud a'zolar "
+        f"{mode_label} rejimda yig'ilmoqda...\n\n"
+        "📥 Yig'ildi: <b>0</b>"
     )
 
     try:
         me = await client.get_me()
         found: dict[int, tuple[str, str, str]] = {}
-        async for item in client.iter_messages(group, limit=message_limit):
-            sender = await item.get_sender()
-            if not sender or getattr(sender, "bot", False):
-                continue
-            sender_id = getattr(sender, "id", None)
-            if not sender_id or sender_id == me.id or sender_id in found:
-                continue
-            sender_username = getattr(sender, "username", None)
-            if not sender_username:
-                continue
-            username = f"@{sender_username}"
-            fullname = get_display_name(sender).strip()
-            found[int(sender_id)] = (username, fullname, str(sender_id))
-            if len(found) >= count:
-                break
+        expected_count = getattr(group, "participants_count", None) or 0
+
+        if not isinstance(group, Chat) and getattr(group, "id", None):
+            try:
+                offset = 0
+                while offset < 20000:
+                    result = await client(GetParticipantsRequest(
+                        channel=group,
+                        filter=ChannelParticipantsSearch(""),
+                        offset=offset,
+                        limit=200,
+                        hash=0,
+                    ))
+                    users = getattr(result, "users", [])
+                    if not users:
+                        break
+                    for participant in users:
+                        if getattr(participant, "bot", False):
+                            continue
+                        participant_id = getattr(participant, "id", None)
+                        if not participant_id or participant_id == me.id:
+                            continue
+                        participant_username = getattr(participant, "username", None)
+                        user_ref = f"@{participant_username}" if participant_username else str(participant_id)
+                        found[int(participant_id)] = (
+                            user_ref,
+                            get_display_name(participant).strip(),
+                            str(participant_id),
+                        )
+                    if len(users) < 200:
+                        break
+                    offset += len(users)
+            except Exception as exc:
+                log.warning("Participants manual terish xatosi (%s): %s", uid, exc)
+
+        if isinstance(group, Chat):
+            participants = await client.get_participants(group, limit=None)
+            for participant in participants:
+                if getattr(participant, "bot", False):
+                    continue
+                participant_id = getattr(participant, "id", None)
+                if not participant_id or participant_id == me.id:
+                    continue
+                participant_username = getattr(participant, "username", None)
+                user_ref = f"@{participant_username}" if participant_username else str(participant_id)
+                found[int(participant_id)] = (
+                    user_ref,
+                    get_display_name(participant).strip(),
+                    str(participant_id),
+                )
+                if len(found) % 100 == 0:
+                    try:
+                        await status.edit_text(
+                            f"⏳ <b>{html.escape(group_title)}</b> guruhidan terilmoqda...\n\n"
+                            f"📥 Yig'ildi: <b>{len(found)}</b>"
+                        )
+                    except Exception:
+                        pass
+        else:
+            async for participant in client.iter_participants(group, limit=None):
+                if getattr(participant, "bot", False):
+                    continue
+                participant_id = getattr(participant, "id", None)
+                if not participant_id or participant_id == me.id:
+                    continue
+                participant_username = getattr(participant, "username", None)
+                user_ref = f"@{participant_username}" if participant_username else str(participant_id)
+                found[int(participant_id)] = (
+                    user_ref,
+                    get_display_name(participant).strip(),
+                    str(participant_id),
+                )
+
+        if len(found) < max(100, expected_count or 0):
+            try:
+                participants = await client.get_participants(group, limit=None)
+                for participant in participants:
+                    if getattr(participant, "bot", False):
+                        continue
+                    participant_id = getattr(participant, "id", None)
+                    if not participant_id or participant_id == me.id or participant_id in found:
+                        continue
+                    participant_username = getattr(participant, "username", None)
+                    user_ref = f"@{participant_username}" if participant_username else str(participant_id)
+                    found[int(participant_id)] = (
+                        user_ref,
+                        get_display_name(participant).strip(),
+                        str(participant_id),
+                    )
+            except Exception as exc:
+                log.warning("Participants fallback xatosi (%s): %s", uid, exc)
+
+        if len(found) < 100 or (expected_count and len(found) < expected_count - 100):
+            try:
+                async for old_message in client.iter_messages(group, limit=5000):
+                    sender = await old_message.get_sender()
+                    if not sender or getattr(sender, "bot", False) or getattr(sender, "deleted", False):
+                        continue
+                    sender_id = getattr(sender, "id", None)
+                    if not sender_id or sender_id == me.id or sender_id in found:
+                        continue
+                    sender_username = getattr(sender, "username", None)
+                    found[int(sender_id)] = (
+                        f"@{sender_username}" if sender_username else str(sender_id),
+                        get_display_name(sender).strip(),
+                        str(sender_id),
+                    )
+                    if len(found) % 100 == 0:
+                        try:
+                            await status.edit_text(
+                                f"⏳ Xabar yozgan foydalanuvchilar qo'shildi...\n\n"
+                                f"📥 Yig'ildi: <b>{len(found)}</b>"
+                            )
+                        except Exception:
+                            pass
+            except Exception as exc:
+                log.warning("Xabar tarixidan fallback xatosi (%s): %s", uid, exc)
+
+        missing_username_ids = [
+            user_id for user_id, (user_ref, _, _) in found.items()
+            if not user_ref.startswith("@")
+        ]
+        for start in range(0, len(missing_username_ids), 100):
+            user_ids = missing_username_ids[start:start + 100]
+            try:
+                resolved_users = await client(GetUsersRequest(user_ids))
+                for resolved in resolved_users:
+                    resolved_id = getattr(resolved, "id", None)
+                    resolved_username = getattr(resolved, "username", None)
+                    if not resolved_id or not resolved_username:
+                        continue
+                    _, fullname, telegram_id = found[int(resolved_id)]
+                    found[int(resolved_id)] = (
+                        f"@{resolved_username}",
+                        fullname or get_display_name(resolved).strip(),
+                        telegram_id,
+                    )
+            except Exception as exc:
+                log.warning("Username resolve xatosi: %s", exc)
+
+        try:
+            await status.edit_text(
+                f"✅ <b>{html.escape(group_title)}</b> guruhidan yig'ildi\n\n"
+                f"📥 Jami: <b>{len(found)}</b> ta"
+            )
+        except Exception:
+            pass
 
         scraped_at = datetime.now(timezone.utc).isoformat()
         async with aiosqlite.connect(DB_FILE) as db:
@@ -3328,26 +3586,33 @@ async def run_scrape_for_count(
             f"✅ Foydalanuvchilar yig'ildi va bazaga saqlandi!\n\n"
             f"🆕 Yangi saqlanganlar: <b>{len(rows)}</b> ta\n"
             f"👥 Jami topilgan: <b>{len(found)}</b> ta\n\n"
-            "Ro'yxat shaxsiy chatga 150 tadan bo'lib yuboriladi.",
+            "Username'lar va username'i yo'q userlarning ID'lari yuboriladi.",
             reply_markup=await get_user_main_keyboard(uid)
         )
-        if found:
+        output_lines: list[str] = []
+        for user_ref, _, telegram_id in found.values():
+            if user_ref.startswith("@"):
+                output_lines.append(html.escape(user_ref))
+            else:
+                output_lines.append(html.escape(telegram_id))
+        if not await user_has_active_pro(uid):
+            await add_scrape_daily_usage(uid, len(found))
+        if output_lines:
             batch: list[str] = []
             batch_chars = 0
-            for username, _, _ in found.values():
-                extra_chars = len(username) + (1 if batch else 0)
-                if batch and (len(batch) >= 150 or batch_chars + extra_chars > 3900):
+            for display in output_lines:
+                extra_chars = len(display) + (1 if batch else 0)
+                if batch and (batch_chars + extra_chars > 3900):
                     await bot.send_message(chat_id=int(uid), text="\n".join(batch))
                     batch = []
                     batch_chars = 0
-                    extra_chars = len(username)
-                batch.append(username)
-                batch_chars += extra_chars
+                batch.append(display)
+                batch_chars += len(display) + (1 if batch_chars else 0)
             if batch:
                 await bot.send_message(chat_id=int(uid), text="\n".join(batch))
         else:
             await bot.send_message(
-                chat_id=int(uid), text="Username’li foydalanuvchi topilmadi."
+                chat_id=int(uid), text="Guruhda foydalanuvchi topilmadi."
             )
     except Exception as exc:
         log.error(f"User yig'ishda xato ({uid}): {exc}")
@@ -3369,7 +3634,7 @@ async def cb_scrape_count(callback: CallbackQuery, state: FSMContext):
     except (ValueError, AttributeError):
         await callback.answer("❌ Noto'g'ri son.", show_alert=True)
         return
-    if count not in (100, 200, 500, 1000, 1500):
+    if count != 500:
         await callback.answer("❌ Noto'g'ri son.", show_alert=True)
         return
     data = await state.get_data()
@@ -3384,15 +3649,20 @@ async def cb_scrape_count(callback: CallbackQuery, state: FSMContext):
     )
 
 
+@dp.callback_query(F.data == "scrape_limit_info")
+async def cb_scrape_limit_info(callback: CallbackQuery):
+    await callback.answer("Kunlik terish limiti — 500 user.", show_alert=True)
+
+
 @dp.message(StateFilter(UserStatesGroup.scrape_count), F.text)
 async def scrape_count_input(message: Message, state: FSMContext):
     try:
         count = int(message.text.strip())
     except ValueError:
-        await message.answer("❌ Tugmalardan birini tanlang yoki 1 dan 1500 gacha son kiriting.")
+        await message.answer("❌ Tugmalardan birini tanlang yoki 1 dan 20000 gacha son kiriting.")
         return
-    if not 1 <= count <= 1500:
-        await message.answer("❌ 1 dan 1500 gacha son kiriting.")
+    if not 1 <= count <= 500:
+        await message.answer("❌ Kunlik limit 500 ta. 1 dan 500 gacha son kiriting.")
         return
     data = await state.get_data()
     mode = data.get("scrape_mode")
@@ -3402,19 +3672,530 @@ async def scrape_count_input(message: Message, state: FSMContext):
     await run_scrape_for_count(message, state, str(message.from_user.id), count, mode)
 
 # ─────────────────────────────────────────────
+# MEMBER ADD / GROUP INVITE
+# ─────────────────────────────────────────────
+MEMBER_ADD_PACKAGES = (500, 1000, 2000, 3000, 4000, 5000)
+MEMBER_ADD_DAILY_LIMIT = 20
+MEMBER_ADD_TRIAL_DAYS = 5
+MEMBER_ADD_USD_PER_STAR = 0.013
+MEMBER_ADD_RUB_PER_USD = 90
+MEMBER_ADD_UZS_PER_USD = 12900
+_member_add_pending: dict[int, dict] = {}
+_member_add_tasks: dict[int, asyncio.Task] = {}
+
+
+def format_member_add_price(stars: int) -> str:
+    stars = int(stars or 0)
+    usd = stars * MEMBER_ADD_USD_PER_STAR
+    return (
+        f"{stars} ⭐ / ~${usd:.2f} / "
+        f"~{usd * MEMBER_ADD_RUB_PER_USD:.0f} ₽ / "
+        f"~{usd * MEMBER_ADD_UZS_PER_USD:,.0f} so'm"
+    )
+
+
+def get_member_add_purchase_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for count in MEMBER_ADD_PACKAGES:
+        kb.row(InlineKeyboardButton(
+            text=f"⭐ {count:,} azo paketini sotib olish",
+            callback_data=f"member_add_purchase:{count}",
+        ))
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="member_add"))
+    return kb.as_markup()
+
+
+async def get_member_add_trial(uid: int | str) -> tuple[bool, str | None]:
+    uid = str(uid)
+    now = datetime.now(timezone.utc)
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT started_at, expires_at FROM member_add_trials WHERE owner_id = ?",
+            (uid,),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            expires = now + timedelta(days=MEMBER_ADD_TRIAL_DAYS)
+            await db.execute(
+                "INSERT INTO member_add_trials(owner_id, started_at, expires_at) VALUES (?, ?, ?)",
+                (uid, now.isoformat(), expires.isoformat()),
+            )
+            await db.commit()
+            return True, expires.isoformat()
+    try:
+        expires = datetime.fromisoformat(row[1])
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        return expires >= now, row[1]
+    except (TypeError, ValueError):
+        return False, row[1]
+
+
+async def get_member_add_credit(uid: int | str) -> int:
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT remaining_count FROM member_add_credits WHERE owner_id = ?",
+            (str(uid),),
+        ) as cur:
+            row = await cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def member_add_feature_available(uid: int | str) -> tuple[bool, str | None]:
+    uid = str(uid)
+    if await user_has_active_pro(uid) or await get_member_add_credit(uid) > 0:
+        return True, None
+    trial, expires_at = await get_member_add_trial(uid)
+    if trial:
+        return True, expires_at
+    return False, expires_at
+
+
+def parse_member_add_users(text: str) -> list[str]:
+    raw_values = re.findall(r"(?:@?[A-Za-z][A-Za-z0-9_]{4,31}|\d{5,20}|t\.me/[A-Za-z0-9_]+)", text or "", flags=re.IGNORECASE)
+    values: list[str] = []
+    seen: set[str] = set()
+    for value in raw_values:
+        value = value.strip().lower()
+        value = value.removeprefix("https://").removeprefix("http://")
+        value = value.removeprefix("www.").removeprefix("t.me/")
+        normalized = f"@{value}" if value.isalpha() or "_" in value else value
+        if normalized.lower() not in seen:
+            seen.add(normalized.lower())
+            values.append(normalized)
+    return values
+
+
+def get_member_add_packages_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(
+        text=f"📆 Kunlik limit: {MEMBER_ADD_DAILY_LIMIT} ta",
+        callback_data="member_add_limit",
+    ))
+    for count in MEMBER_ADD_PACKAGES:
+        kb.row(InlineKeyboardButton(
+            text=f"👥 {count:,} azo",
+            callback_data=f"member_add_purchase:{count}",
+        ))
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="start"))
+    return kb.as_markup()
+
+
+async def get_member_add_prices() -> dict[int, int]:
+    async with aiosqlite.connect(DB_FILE) as db:
+        rows = await db.execute_fetchall(
+            "SELECT package_count, price FROM member_add_prices"
+        )
+    defaults = {count: 0 for count in MEMBER_ADD_PACKAGES}
+    defaults.update({int(row[0]): int(row[1]) for row in rows})
+    return defaults
+
+
+async def run_member_add_order(order_id: int):
+    async with aiosqlite.connect(DB_FILE) as db:
+        row = await db.execute_fetchall(
+            "SELECT user_id, package_count, target_chat, invite_profile, status "
+            "FROM member_add_orders WHERE id = ?", (order_id,)
+        )
+        if not row:
+            return
+        user_id, package_count, target_chat, profile_id, status = row[0]
+        db_users = await db.execute_fetchall(
+            "SELECT username FROM member_add_users WHERE order_id = ?", (order_id,)
+        )
+    users = [row[0] for row in db_users]
+    client = userbot_clients.get(str(profile_id))
+    if not client:
+        await bot.send_message(int(user_id), "❌ Tanlangan profil hozir ulangan emas.")
+        return
+
+    if not client.is_connected():
+        await client.connect()
+    try:
+        target = await client.get_entity(target_chat)
+    except Exception as exc:
+        await bot.send_message(int(user_id), f"❌ Guruh topilmadi: {exc}")
+        return
+
+    added = 0
+    failed = 0
+    today = datetime.now(timezone.utc).date().isoformat()
+    for user_ref in users[:package_count]:
+        async with aiosqlite.connect(DB_FILE) as db:
+            daily = await db.execute_fetchall(
+                "SELECT added_count FROM member_add_daily_usage "
+                "WHERE owner_id = ? AND usage_date = ?", (profile_id, today)
+            )
+            used = int(daily[0][0]) if daily else 0
+        unlimited_member_add = (
+            await user_has_active_pro(user_id) or await get_member_add_credit(user_id) > 0
+        )
+        if not unlimited_member_add and used >= MEMBER_ADD_DAILY_LIMIT:
+            break
+        try:
+            user = await client.get_input_entity(user_ref)
+            if getattr(target, "broadcast", False) or getattr(target, "megagroup", False):
+                await client(InviteToChannelRequest(target, [user]))
+            else:
+                await client(AddChatUserRequest(chat_id=target.id, user_id=user, fwd_limit=0))
+            added += 1
+            async with aiosqlite.connect(DB_FILE) as db:
+                await db.execute(
+                    "INSERT INTO member_add_daily_usage (owner_id, usage_date, added_count) "
+                    "VALUES (?, ?, 1) ON CONFLICT(owner_id, usage_date) "
+                    "DO UPDATE SET added_count = added_count + 1", (profile_id, today)
+                )
+                await db.commit()
+        except (UserAlreadyParticipantError,):
+            # User guruhda bor; buni xato deb sanamasdan keyingi userga o'tamiz.
+            continue
+        except (UserPrivacyRestrictedError, UserIdInvalidError, UsernameNotOccupiedError,
+                InputUserDeactivatedError, ChannelPrivateError) as exc:
+            failed += 1
+            log.warning("Member-add xatosi %s: %s", user_ref, type(exc).__name__)
+        except PeerFloodError as exc:
+            failed += 1
+            await asyncio.sleep(getattr(exc, "seconds", 60) + 1)
+        except FloodWaitError as exc:
+            failed += 1
+            await asyncio.sleep(exc.seconds + 1)
+        except Exception as exc:
+            failed += 1
+            log.warning("Member-add xatosi %s: %s", user_ref, exc)
+        await asyncio.sleep(3 if not unlimited_member_add else 1)
+
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "UPDATE member_add_orders SET status = ?, added_count = ?, failed_count = ? WHERE id = ?",
+            ("completed" if added else "failed", added, failed, order_id)
+        )
+        await db.commit()
+        if not await user_has_active_pro(user_id) and added > 0:
+            async with aiosqlite.connect(DB_FILE) as db:
+                await db.execute(
+                    "UPDATE member_add_credits SET remaining_count = MAX(0, remaining_count - ?) "
+                    "WHERE owner_id = ?",
+                    (added, str(user_id)),
+                )
+                await db.commit()
+        await bot.send_message(
+        int(user_id),
+        f"✅ <b>A'zo qo'shish yakunlandi</b>\n"
+        f"Qo'shildi: <b>{added}</b>\nO'tkazib yuborildi/xato: <b>{failed}</b>\n"
+        f"Kunlik limit: <b>{MEMBER_ADD_DAILY_LIMIT}</b>",
+    )
+
+
+def get_admin_member_add_keyboard(prices: dict[int, int]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for count in MEMBER_ADD_PACKAGES:
+        kb.row(InlineKeyboardButton(
+            text=f"{count:,} azo - {format_member_add_price(prices[count])}",
+            callback_data=f"admin_member_price:{count}",
+        ))
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin_panel"))
+    return kb.as_markup()
+
+
+@dp.callback_query(F.data == "admin_member_add")
+async def cb_admin_member_add(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Faqat owner uchun", show_alert=True)
+        return
+    prices = await get_member_add_prices()
+    await callback.message.edit_text(
+        "👥 <b>A'zo qo'shish paketlari</b>\n"
+        f"Kunlik limit: <b>{MEMBER_ADD_DAILY_LIMIT} ta</b>\nPaket narxini o'zgartirish uchun boshing:",
+        reply_markup=get_admin_member_add_keyboard(prices),
+    )
+
+
+@dp.callback_query(F.data.startswith("admin_member_price:"))
+async def cb_admin_member_price(callback: CallbackQuery, state: FSMContext):
+    count = int(callback.data.split(":", 1)[1])
+    await state.update_data(member_add_count=count)
+    await state.set_state(UserStatesGroup.admin_member_add_price)
+    await callback.message.edit_text(
+        f"{count:,} azo paketi narxini faqat Stars bilan raqamda yuboring:\n"
+        "Masalan: <b>100</b>\n"
+        "Bot USD, RUB va UZS ekvivalentini avtomatik ko'rsatadi.",
+        reply_markup=back_kb("admin_member_add"),
+    )
+
+
+@dp.message(StateFilter(UserStatesGroup.admin_member_add_price), F.text)
+async def admin_member_add_price_input(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        price = int(message.text.replace(" ", ""))
+        if price < 0:
+            raise ValueError
+        data = await state.get_data()
+        count = int(data["member_add_count"])
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute(
+                "INSERT INTO member_add_prices(package_count, price) VALUES (?, ?) "
+                "ON CONFLICT(package_count) DO UPDATE SET price = excluded.price",
+                (count, price),
+            )
+            await db.commit()
+        await state.clear()
+        await message.answer(
+            f"✅ {count:,} azo paketi narxi saqlandi:\n"
+            f"{format_member_add_price(price)}"
+        )
+        prices = await get_member_add_prices()
+        await message.answer("👥 Paketlar:", reply_markup=get_admin_member_add_keyboard(prices))
+    except ValueError:
+        await message.answer("Faqat 0 yoki musbat butun son kiriting.")
+
+
+@dp.callback_query(F.data == "member_add")
+async def cb_member_add_start(callback: CallbackQuery):
+    prices = await get_member_add_prices()
+    available, expires_at = await member_add_feature_available(callback.from_user.id)
+    lines = ["👥 <b>Guruhga a'zo qo'shish</b>", f"Kunlik limit: <b>{MEMBER_ADD_DAILY_LIMIT} ta</b>"]
+    if not available:
+        lines.append("⛔ 5 kunlik sinov muddati tugagan.")
+        lines.append("PRO obuna yoki Stars paketi bilan davom ettiring.")
+    elif not await user_has_active_pro(callback.from_user.id) and await get_member_add_credit(callback.from_user.id) <= 0:
+        lines.append("🆓 Sinov faolligi: kuniga 20 ta, 5 kun.")
+    for count in MEMBER_ADD_PACKAGES:
+        lines.append(f"• {count:,} azo - <b>{format_member_add_price(prices[count])}</b>")
+    await callback.message.edit_text("\n".join(lines), reply_markup=get_member_add_packages_keyboard())
+
+
+@dp.callback_query(F.data == "member_add_limit")
+async def cb_member_add_limit(callback: CallbackQuery, state: FSMContext):
+    available, _ = await member_add_feature_available(callback.from_user.id)
+    if not available:
+        await callback.answer(
+            "5 kunlik sinov tugagan. Paketlardan birini Stars bilan sotib oling.",
+            show_alert=True,
+        )
+        return
+    _member_add_pending[callback.from_user.id] = {
+        "package_count": MEMBER_ADD_DAILY_LIMIT
+    }
+    await state.set_state(UserStatesGroup.member_add_group)
+    await callback.message.edit_text(
+        f"📆 <b>Kunlik limit: {MEMBER_ADD_DAILY_LIMIT} ta</b>\n\n"
+        "A'zolar qo'shiladigan guruh linkini yuboring:"
+    )
+
+
+@dp.callback_query(F.data.startswith("member_add_package:"))
+async def cb_member_add_package(callback: CallbackQuery, state: FSMContext):
+    count = int(callback.data.split(":", 1)[1])
+    available, _ = await member_add_feature_available(callback.from_user.id)
+    has_pro = await user_has_active_pro(callback.from_user.id)
+    if not available and not has_pro and await get_member_add_credit(callback.from_user.id) <= 0:
+        price = (await get_member_add_prices()).get(count, 0)
+        if price <= 0:
+            await callback.answer("Bu paket uchun narx belgilanmagan.", show_alert=True)
+            return
+        order_id = os.urandom(12).hex()
+        payload = f"member_add:{callback.from_user.id}:{count}:{order_id}"
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute(
+                "INSERT INTO paid_feature_orders "
+                "(id, user_id, payload, feature, amount, status, created_at) "
+                "VALUES (?, ?, ?, 'member_add', ?, 'pending', ?)",
+                (order_id, str(callback.from_user.id), payload, price,
+                 datetime.now(timezone.utc).isoformat()),
+            )
+            await db.commit()
+        await callback.message.answer_invoice(
+            title=f"{count:,} a'zo qo'shish paketi",
+            description=f"{count:,} a'zo qo'shish uchun {price} Telegram Stars.",
+            payload=payload,
+            provider_token="",
+            currency="XTR",
+            prices=[LabeledPrice(label=f"{count:,} azo krediti", amount=price)],
+            start_parameter="member-add",
+        )
+        await callback.answer()
+        return
+    _member_add_pending[callback.from_user.id] = {"package_count": count}
+    await state.set_state(UserStatesGroup.member_add_group)
+    await callback.message.edit_text(
+        f"👥 <b>{count:,} azo</b> paketi tanlandi.\n\nA'zolar qo'shiladigan guruh linkini yuboring:"
+    )
+
+
+@dp.callback_query(F.data.startswith("member_add_purchase:"))
+async def cb_member_add_purchase(callback: CallbackQuery):
+    count = int(callback.data.split(":", 1)[1])
+    price = (await get_member_add_prices()).get(count, 0)
+    if count not in MEMBER_ADD_PACKAGES or price <= 0:
+        await callback.answer("Bu paket uchun narx belgilanmagan.", show_alert=True)
+        return
+    order_id = os.urandom(12).hex()
+    payload = f"member_add:{callback.from_user.id}:{count}:{order_id}"
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT INTO paid_feature_orders "
+            "(id, user_id, payload, feature, amount, status, created_at) "
+            "VALUES (?, ?, ?, 'member_add', ?, 'pending', ?)",
+            (order_id, str(callback.from_user.id), payload, price,
+             datetime.now(timezone.utc).isoformat()),
+        )
+        await db.commit()
+    await callback.message.answer_invoice(
+        title=f"{count:,} a'zo qo'shish paketi",
+        description=f"{count:,} a'zo qo'shish krediti uchun {format_member_add_price(price)}.",
+        payload=payload,
+        provider_token="",
+        currency="XTR",
+        prices=[LabeledPrice(label=f"{count:,} azo krediti", amount=price)],
+        start_parameter="member-add",
+    )
+    await callback.answer()
+
+
+@dp.message(StateFilter(UserStatesGroup.member_add_group), F.text)
+async def member_add_group_input(message: Message, state: FSMContext):
+    group = message.text.strip()
+    pending = _member_add_pending.setdefault(message.from_user.id, {})
+    pending["target_chat"] = group
+    await state.set_state(UserStatesGroup.member_add_admin)
+    await message.answer(
+        "A'zolarni qo'shuvchi profil admin userini yuboring:\n"
+        "- Telegram user ID\n- @username\n- /admin orqali ulangan profile"
+    )
+
+
+@dp.message(StateFilter(UserStatesGroup.member_add_admin), F.text)
+async def member_add_admin_input(message: Message, state: FSMContext):
+    profile = message.text.strip().lstrip("@")
+    matched_id = None
+    for uid, client in userbot_clients.items():
+        try:
+            me = await client.get_me()
+            if profile == str(uid) or profile.lower() == str(getattr(me, "username", "") or "").lower():
+                matched_id = uid
+                break
+        except Exception:
+            continue
+    if not matched_id:
+        await message.answer("❌ Bu profil userboti ulanmagan yoki ID/username topilmadi. Avval profilni ulang.")
+        return
+    pending = _member_add_pending.setdefault(message.from_user.id, {})
+    pending["invite_profile"] = matched_id
+    await state.set_state(UserStatesGroup.member_add_users)
+    await message.answer(
+        "Userlar ro'yxatini yuboring, reply qiling yoki .txt fayl tashlang:\n"
+        "Har bir user: @username, user ID yoki t.me havola bo'lishi mumkin."
+    )
+
+
+async def extract_member_add_users(message: Message) -> list[str]:
+    source = message.reply_to_message or message
+    texts: list[str] = []
+    if source.text:
+        texts.append(source.text)
+    document = source.document
+    if document:
+        from io import BytesIO
+        output = BytesIO()
+        await bot.download(document, destination=output)
+        output.seek(0)
+        try:
+            texts.append(output.read().decode("utf-8"))
+        except UnicodeDecodeError:
+            texts.append(output.read().decode("utf-8", errors="ignore"))
+    return parse_member_add_users("\n".join(texts))
+
+
+@dp.message(StateFilter(UserStatesGroup.member_add_users))
+async def member_add_users_input(message: Message, state: FSMContext):
+    users = await extract_member_add_users(message)
+    pending = _member_add_pending.get(message.from_user.id, {})
+    if not users:
+        await message.answer("❌ User topilmadi. @username, ID yoki t.me havola yuboring.")
+        return
+    package_count = int(pending["package_count"])
+    today = datetime.now(timezone.utc).date().isoformat()
+    profile_id = str(pending["invite_profile"])
+    async with aiosqlite.connect(DB_FILE) as db:
+        daily = await db.execute_fetchall(
+            "SELECT added_count FROM member_add_daily_usage WHERE owner_id = ? AND usage_date = ?",
+            (profile_id, today),
+        )
+        used = int(daily[0][0]) if daily else 0
+        if used >= MEMBER_ADD_DAILY_LIMIT:
+            if not await user_has_active_pro(message.from_user.id) and await get_member_add_credit(message.from_user.id) <= 0:
+                await message.answer(
+                    "❌ Sinov kunlik 20 ta qo'shish limitiga yetdi.\n"
+                    "PRO sotib oling yoki Stars paketi xarid qiling.",
+                    reply_markup=get_member_add_purchase_keyboard(),
+                )
+                await state.clear()
+                _member_add_pending.pop(message.from_user.id, None)
+            else:
+                await message.answer("❌ Bu profilning bugungi limitiga yetildi.")
+            return
+        cursor = await db.execute(
+            "INSERT INTO member_add_orders "
+            "(user_id, package_count, target_chat, invite_profile, status, created_at) "
+            "VALUES (?, ?, ?, ?, 'queued', ?)",
+            (str(message.from_user.id), package_count, pending["target_chat"], profile_id,
+             datetime.now(timezone.utc).isoformat()),
+        )
+        order_id = cursor.lastrowid
+        await db.executemany(
+            "INSERT INTO member_add_users(order_id, position, username) VALUES (?, ?, ?)",
+            [(order_id, position, username) for position, username in enumerate(users[:package_count], 1)],
+        )
+        await db.commit()
+    await state.clear()
+    _member_add_pending.pop(message.from_user.id, None)
+    stop_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="⏹ A'zo qo'shishni to'xtatish", callback_data="member_add_stop")
+    ]])
+    await message.answer(
+        f"✅ Buyurtma yaratildi.\nUserlar: <b>{min(len(users), package_count)}</b> ta\n"
+        "A'zo qo'shish boshlandi.",
+        reply_markup=stop_keyboard,
+    )
+    task = asyncio.create_task(run_member_add_order(order_id))
+    _member_add_tasks[message.from_user.id] = task
+
+
+@dp.callback_query(F.data == "member_add_stop")
+async def cb_member_add_stop(callback: CallbackQuery):
+    task = _member_add_tasks.get(callback.from_user.id)
+    if not task or task.done():
+        await callback.answer("Faol a'zo qo'shish jarayoni yo'q.", show_alert=True)
+        return
+    task.cancel()
+    _member_add_tasks.pop(callback.from_user.id, None)
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "UPDATE member_add_orders SET status = 'stopped' "
+            "WHERE user_id = ? AND status IN ('queued', 'waiting_list') ORDER BY id DESC LIMIT 1",
+            (str(callback.from_user.id),),
+        )
+        await db.commit()
+    await callback.answer("A'zo qo'shish to'xtatildi.", show_alert=True)
+
+
+# ─────────────────────────────────────────────
 # ADMIN PANEL
 # ─────────────────────────────────────────────
 def get_admin_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     if not is_clone_bot():
         kb.row(InlineKeyboardButton(text="📢 Kanallarni boshqarish", callback_data="admin_channels"))
-        kb.row(InlineKeyboardButton(text="🤖 Klonlar va Stars narxi", callback_data="admin_clone_settings"))
+        kb.row(InlineKeyboardButton(text="⭐ PRO Stars narxi", callback_data="admin_clone_settings"))
     kb.row(InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="admin_users"))
     kb.row(InlineKeyboardButton(text="⭐ PRO berish", callback_data="admin_give_pro"))
     kb.row(InlineKeyboardButton(text="🎉 Konkurs yaratish", callback_data="admin_contest_create"))
     kb.row(InlineKeyboardButton(text="🏆 Aktiv konkurslar", callback_data="admin_contests_list"))
     kb.row(InlineKeyboardButton(text="📣 Xabar tarqatish", callback_data="admin_broadcast"))
-    kb.row(InlineKeyboardButton(text="😀 Custom emoji pack", callback_data="admin_custom_emoji"))
+    kb.row(InlineKeyboardButton(text="� A'zo qo'shish paketlari", callback_data="admin_member_add"))
+    kb.row(InlineKeyboardButton(text="�😀 Custom emoji pack", callback_data="admin_custom_emoji"))
     if not is_clone_bot():
         kb.row(InlineKeyboardButton(text="🛡 Raid guruhlarini tanlash", callback_data="admin_raid_groups"))
         kb.row(InlineKeyboardButton(text="👤 Raid userlariga ruxsat", callback_data="admin_raid_users"))
@@ -3586,73 +4367,54 @@ async def cb_admin_clone_settings(callback: CallbackQuery):
     if is_clone_bot() or not is_panel_owner(callback.from_user.id):
         await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
         return
-    price = await get_clone_price()
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute("SELECT COUNT(*) FROM cloned_bots WHERE active = 1") as cur:
-            clone_count = (await cur.fetchone())[0]
+    pro_price = await get_pro_price()
     kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text="💫 Narxni o'zgartirish", callback_data="admin_clone_price"))
-    kb.row(InlineKeyboardButton(text="📋 Klonlar ro'yxati", callback_data="admin_clones_list"))
+    kb.row(InlineKeyboardButton(text="💎 PRO Stars narxini o'zgartirish", callback_data="admin_pro_price"))
     kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin_panel"))
     await callback.message.edit_text(
-        f"🤖 <b>Bot klonlarini sotish</b>\n\nNarx: <b>{price} Stars</b>\nFaol klonlar: <b>{clone_count}</b>",
+        "🤖 <b>Stars narxlari</b>\n\n"
+        f"30 kunlik PRO: <b>{pro_price} Stars</b>\n"
+        "Bot klonini yaratish funksiyasi o'chirilgan.",
         reply_markup=kb.as_markup()
     )
 
 
-@dp.callback_query(F.data == "admin_clone_price")
-async def cb_admin_clone_price(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "admin_pro_price")
+async def cb_admin_pro_price(callback: CallbackQuery, state: FSMContext):
     if is_clone_bot() or not is_panel_owner(callback.from_user.id):
         await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
         return
     await callback.message.edit_text(
-        "Klonning yangi narxini Telegram Stars'da yuboring (0 dan 100000 gacha butun son; 0 bepul):",
-        reply_markup=back_kb("admin_clone_settings")
+        "30 kunlik PRO tarif narxini Telegram Stars'da kiriting (1-100000):",
+        reply_markup=back_kb("admin_clone_settings"),
     )
-    await state.set_state(UserStatesGroup.admin_clone_price)
+    await state.set_state(UserStatesGroup.admin_pro_price)
 
 
-@dp.message(StateFilter(UserStatesGroup.admin_clone_price), F.text)
-async def admin_clone_price_input(message: Message, state: FSMContext):
+@dp.message(StateFilter(UserStatesGroup.admin_pro_price), F.text)
+async def admin_pro_price_input(message: Message, state: FSMContext):
     if is_clone_bot() or not is_panel_owner(message.from_user.id):
         return
     try:
         price = int(message.text.strip())
     except ValueError:
-        await message.answer("0 dan 100000 gacha butun Stars sonini kiriting.")
+        await message.answer("1 dan 100000 gacha butun Stars sonini kiriting.")
         return
-    if not 0 <= price <= 100000:
-        await message.answer("Narx 0 dan 100000 Stars oralig'ida bo'lishi kerak.")
+    if not 1 <= price <= 100000:
+        await message.answer("PRO narxi 1 dan 100000 Stars oralig'ida bo'lishi kerak.")
         return
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(
-            "INSERT INTO bot_settings (key, value) VALUES ('clone_price_stars', ?) "
+            "INSERT INTO bot_settings (key, value) VALUES ('pro_price_stars', ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (str(price),)
+            (str(price),),
         )
         await db.commit()
     await state.clear()
     await message.answer(
-        f"Narx belgilandi: <b>{price} Stars</b>.",
-        reply_markup=get_admin_keyboard()
+        f"PRO narxi belgilandi: <b>{price} Stars</b>.",
+        reply_markup=get_admin_keyboard(),
     )
-
-
-@dp.callback_query(F.data == "admin_clones_list")
-async def cb_admin_clones_list(callback: CallbackQuery):
-    if is_clone_bot() or not is_panel_owner(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
-        return
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute(
-            "SELECT username, owner_id, created_at FROM cloned_bots WHERE active = 1 ORDER BY created_at DESC LIMIT 50"
-        ) as cur:
-            rows = await cur.fetchall()
-    text = "📋 <b>Ulangan klonlar</b>\n\n" + (
-        "\n".join(f"@{html.escape(name)} | egasi <code>{owner}</code>" for name, owner, _ in rows)
-        if rows else "Hozircha faol klonlar yo'q."
-    )
-    await callback.message.edit_text(text, reply_markup=back_kb("admin_clone_settings"))
 
 
 @dp.callback_query(F.data == "admin_custom_emoji")
@@ -5338,6 +6100,7 @@ async def load_existing_sessions():
                 if authorized:
                     userbot_clients[uid] = client
                     await register_userbot_handlers(client, uid)
+                    await set_ad_bio(client, is_pro=False)
                     keep_client = True
                 else:
                     async with aiosqlite.connect(DB_FILE) as db:
@@ -5376,10 +6139,7 @@ async def poll_clone_updates(clone_bot: Bot, bot_id: int, owner_id: int, usernam
                 offset = update.update_id + 1
                 callback_query = update.callback_query
                 callback_data = callback_query.data or "" if callback_query else ""
-                if callback_query and (
-                    callback_data == "ban_panel"
-                    or callback_data.startswith(("raid_", "admin_raid_"))
-                ):
+                if callback_query and callback_data.startswith(("raid_", "admin_raid_")):
                     await clone_bot.answer_callback_query(
                         callback_query.id,
                         text="Raid clone botda mavjud emas.",
@@ -5490,7 +6250,7 @@ async def main():
         asyncio.create_task(health_server())
         await load_existing_sessions()
         register_common_keyboard_buttons()
-        await load_registered_clones()
+        # Clone bots are disabled.
         asyncio.create_task(pro_expiration_checker())
         asyncio.create_task(bio_watcher())
         await dp.start_polling(primary_bot, skip_updates=True)
