@@ -1540,6 +1540,9 @@ async def cb_profile(callback: CallbackQuery):
     subscription = "Bepul" if FREE_MODE else (
         "PRO" if is_pro_user(user[1] if user else None) else "Oddiy"
     )
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="🕐 Profil soati", callback_data="clock_menu"))
+    kb.row(InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="main_menu"))
     await callback.message.edit_text(
         "👤 <b>Profil</b>\n\n"
         f"🆔 ID: <code>{uid}</code>\n"
@@ -1547,7 +1550,7 @@ async def cb_profile(callback: CallbackQuery):
         f"💳 Tarif: <b>{subscription}</b>\n"
         f"📱 Ulangan akkauntlar: <b>{account_count}</b>\n"
         f"👥 Bazadagi userlar: <b>{scraped_count}</b>",
-        reply_markup=back_kb("main_menu")
+        reply_markup=kb.as_markup()
     )
 
 
@@ -6729,6 +6732,7 @@ async def main():
         # Clone bots are disabled.
         asyncio.create_task(pro_expiration_checker())
         asyncio.create_task(bio_watcher())
+        asyncio.create_task(profile_clock_watcher())
         await dp.start_polling(primary_bot, skip_updates=True)
     finally:
         try:
