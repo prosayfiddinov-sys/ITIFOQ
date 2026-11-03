@@ -312,6 +312,18 @@ async def init_db():
             value TEXT NOT NULL
         )""")
         await db.execute("""
+        CREATE TABLE IF NOT EXISTS bot_admins (
+            user_id TEXT PRIMARY KEY,
+            added_by TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS bot_admin_permissions (
+            user_id TEXT NOT NULL,
+            callback_data TEXT NOT NULL,
+            PRIMARY KEY (user_id, callback_data)
+        )""")
+        await db.execute("""
         CREATE TABLE IF NOT EXISTS clone_orders (
             id TEXT PRIMARY KEY,
             user_id TEXT NOT NULL,
@@ -4471,12 +4483,14 @@ async def cb_member_add_stop(callback: CallbackQuery):
 # ─────────────────────────────────────────────
 # ADMIN PANEL
 # ─────────────────────────────────────────────
-def get_admin_keyboard() -> InlineKeyboardMarkup:
+def get_admin_keyboard(allowed_callbacks: set[str] | None = None) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     if not is_clone_bot():
         kb.row(InlineKeyboardButton(text="📢 Kanallarni boshqarish", callback_data="admin_channels"))
         kb.row(InlineKeyboardButton(text="⭐ PRO Stars narxi", callback_data="admin_clone_settings"))
     kb.row(InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="admin_users"))
+    if not is_clone_bot():
+        kb.row(InlineKeyboardButton(text="🛡 Admin qo'shish", callback_data="admin_manage_admins"))
     kb.row(InlineKeyboardButton(text="⭐ PRO berish", callback_data="admin_give_pro"))
     kb.row(InlineKeyboardButton(text="🎉 Konkurs yaratish", callback_data="admin_contest_create"))
     kb.row(InlineKeyboardButton(text="🏆 Aktiv konkurslar", callback_data="admin_contests_list"))
@@ -4486,7 +4500,20 @@ def get_admin_keyboard() -> InlineKeyboardMarkup:
     if not is_clone_bot():
         kb.row(InlineKeyboardButton(text="🛡 Raid guruhlarini tanlash", callback_data="admin_raid_groups"))
         kb.row(InlineKeyboardButton(text="👤 Raid userlariga ruxsat", callback_data="admin_raid_users"))
-    return kb.as_markup()
+    markup = kb.as_markup()
+    if allowed_callbacks is None:
+        return markup
+    filtered_rows = []
+    for row in markup.inline_keyboard:
+        filtered_row = [
+            button for button in row
+            if button.callback_data in allowed_callbacks
+        ]
+        if filtered_row:
+            filtered_rows.append(filtered_row)
+    if filtered_rows:
+        filtered_rows.append([InlineKeyboardButton(text="⬅️ Asosiy admin paneli", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=filtered_rows)
 
 
 def normalize_custom_emoji_pack(value: str) -> str | None:
@@ -4569,11 +4596,31 @@ def get_admin_raid_users_keyboard() -> InlineKeyboardMarkup:
     kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin_panel"))
     return kb.as_markup()
 
+async def is_bot_admin(user_id: int) -> bool:
+    async with aiosqlite.connect(DB_FILE) as db:
+        row = await db.execute_fetchall(
+            "SELECT 1 FROM bot_admins WHERE user_id = ?", (str(user_id),)
+        )
+    return bool(row)
+
+
+async def get_bot_admin_permissions(user_id: int) -> set[str]:
+    async with aiosqlite.connect(DB_FILE) as db:
+        rows = await db.execute_fetchall(
+            "SELECT callback_data FROM bot_admin_permissions WHERE user_id = ?", (str(user_id),)
+        )
+    return {row[0] for row in rows}
+
+
 @dp.message(Command("admin"), F.chat.type == "private")
 async def cmd_admin(message: Message):
-    if not is_panel_owner(message.from_user.id):
+    if is_panel_owner(message.from_user.id):
+        permissions = None
+    elif await is_bot_admin(message.from_user.id):
+        permissions = await get_bot_admin_permissions(message.from_user.id)
+    else:
         return
-    await message.answer("🔐 <b>Admin Panel</b>", reply_markup=get_admin_keyboard())
+    await message.answer("🔐 <b>Admin Panel</b>", reply_markup=get_admin_keyboard(permissions))
 
 
 @dp.message(Command("source"), F.chat.type == "private")
@@ -4640,13 +4687,155 @@ async def cmd_source(message: Message):
 
 @dp.callback_query(F.data == "admin_panel")
 async def cb_admin_panel(callback: CallbackQuery):
-    if not is_panel_owner(callback.from_user.id):
+    if not is_panel_owner(callback.from_user.id) and not await is_bot_admin(callback.from_user.id):
         await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
         return
     try:
-        await callback.message.edit_text("🔐 <b>Admin Panel</b>", reply_markup=get_admin_keyboard())
+        if is_panel_owner(callback.from_user.id):
+            permissions = None
+        else:
+            permissions = await get_bot_admin_permissions(callback.from_user.id)
+        await callback.message.edit_text(
+            "🔐 <b>Admin Panel</b>", reply_markup=get_admin_keyboard(permissions)
+        )
     except Exception:
         await callback.answer()
+
+
+ADMIN_PERMISSION_OPTIONS = (
+    ("admin_users", "👥 Foydalanuvchilar"),
+    ("admin_give_pro", "⭐ PRO berish"),
+    ("admin_contest_create", "🎉 Konkurs yaratish"),
+    ("admin_contests_list", "🏆 Aktiv konkurslar"),
+    ("admin_broadcast", "📣 Xabar tarqatish"),
+    ("admin_member_add", "👥 A'zo qo'shish paketlari"),
+    ("admin_custom_emoji", "😀 Custom emoji pack"),
+)
+
+
+@dp.callback_query(F.data == "admin_manage_admins")
+async def cb_admin_manage_admins(callback: CallbackQuery):
+    if not is_panel_owner(callback.from_user.id):
+        await callback.answer("Faqat owner uchun", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_FILE) as db:
+        rows = await db.execute_fetchall(
+            "SELECT user_id FROM bot_admins ORDER BY created_at DESC"
+        )
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="➕ Admin qo'shish", callback_data="admin_add_admin"))
+    for (user_id,) in rows:
+        kb.row(InlineKeyboardButton(text=f"🛡 Admin: {user_id}", callback_data=f"admin_edit:{user_id}"))
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin_panel"))
+    await callback.message.edit_text(
+        "🛡 <b>Adminlar</b>\nQo'shilgan admin va uning ko'rinadigan tugmalarini tanlang:",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@dp.callback_query(F.data == "admin_add_admin")
+async def cb_admin_add_admin(callback: CallbackQuery, state: FSMContext):
+    if not is_panel_owner(callback.from_user.id):
+        await callback.answer("Faqat owner uchun", show_alert=True)
+        return
+    await state.set_state(UserStatesGroup.admin_add_user)
+    await callback.message.edit_text(
+        "🛡 <b>Yangi admin</b>\nTelegram user ID yoki @username yuboring:",
+        reply_markup=back_kb("admin_manage_admins"),
+    )
+
+
+@dp.message(StateFilter(UserStatesGroup.admin_add_user), F.text)
+async def admin_add_user_input(message: Message, state: FSMContext):
+    if not is_panel_owner(message.from_user.id):
+        return
+    raw = message.text.strip()
+    try:
+        if raw.isdigit():
+            admin_id = int(raw)
+        else:
+            chat = await primary_bot.get_chat(raw if raw.startswith("@") else f"@{raw}")
+            admin_id = int(chat.id)
+    except Exception as exc:
+        await message.answer(f"❌ Admin topilmadi: {exc}")
+        return
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO bot_admins(user_id, added_by, created_at) VALUES (?, ?, ?)",
+            (str(admin_id), str(message.from_user.id), datetime.now(timezone.utc).isoformat()),
+        )
+        await db.commit()
+    await state.clear()
+    await message.answer(f"✅ Admin qo'shildi: <code>{admin_id}</code>")
+    await show_admin_permissions(message, admin_id)
+
+
+async def show_admin_permissions(message_or_callback, admin_id: int):
+    async with aiosqlite.connect(DB_FILE) as db:
+        rows = await db.execute_fetchall(
+            "SELECT callback_data FROM bot_admin_permissions WHERE user_id = ?", (str(admin_id),)
+        )
+    selected = {row[0] for row in rows}
+    kb = InlineKeyboardBuilder()
+    for callback_data, title in ADMIN_PERMISSION_OPTIONS:
+        mark = "✅" if callback_data in selected else "⬜"
+        kb.row(InlineKeyboardButton(
+            text=f"{mark} {title}", callback_data=f"admin_perm_toggle:{admin_id}:{callback_data}"
+        ))
+    kb.row(InlineKeyboardButton(text="🗑 Adminni o'chirish", callback_data=f"admin_remove:{admin_id}"))
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin_manage_admins"))
+    text = f"🛡 <b>Admin {admin_id}</b>\nFaqat tanlangan tugmalar ko'rinadi:"
+    if hasattr(message_or_callback, "edit_text"):
+        await message_or_callback.edit_text(text, reply_markup=kb.as_markup())
+    else:
+        await message_or_callback.answer(text, reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data.startswith("admin_edit:"))
+async def cb_admin_edit(callback: CallbackQuery):
+    if not is_panel_owner(callback.from_user.id):
+        await callback.answer("Faqat owner uchun", show_alert=True)
+        return
+    admin_id = int(callback.data.split(":", 1)[1])
+    await show_admin_permissions(callback.message, admin_id)
+
+
+@dp.callback_query(F.data.startswith("admin_perm_toggle:"))
+async def cb_admin_perm_toggle(callback: CallbackQuery):
+    if not is_panel_owner(callback.from_user.id):
+        await callback.answer("Faqat owner uchun", show_alert=True)
+        return
+    _, admin_id, callback_data = callback.data.split(":", 2)
+    async with aiosqlite.connect(DB_FILE) as db:
+        row = await db.execute_fetchall(
+            "SELECT 1 FROM bot_admin_permissions WHERE user_id = ? AND callback_data = ?",
+            (admin_id, callback_data),
+        )
+        if row:
+            await db.execute(
+                "DELETE FROM bot_admin_permissions WHERE user_id = ? AND callback_data = ?",
+                (admin_id, callback_data),
+            )
+        else:
+            await db.execute(
+                "INSERT INTO bot_admin_permissions(user_id, callback_data) VALUES (?, ?)",
+                (admin_id, callback_data),
+            )
+        await db.commit()
+    await show_admin_permissions(callback.message, int(admin_id))
+
+
+@dp.callback_query(F.data.startswith("admin_remove:"))
+async def cb_admin_remove(callback: CallbackQuery):
+    if not is_panel_owner(callback.from_user.id):
+        await callback.answer("Faqat owner uchun", show_alert=True)
+        return
+    admin_id = callback.data.split(":", 1)[1]
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("DELETE FROM bot_admin_permissions WHERE user_id = ?", (admin_id,))
+        await db.execute("DELETE FROM bot_admins WHERE user_id = ?", (admin_id,))
+        await db.commit()
+    await cb_admin_manage_admins(callback)
 
 
 @dp.callback_query(F.data == "admin_clone_settings")
