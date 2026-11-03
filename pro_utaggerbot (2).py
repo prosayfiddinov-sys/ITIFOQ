@@ -3915,7 +3915,9 @@ async def run_member_add_order(order_id: int):
     added = 0
     failed = 0
     today = datetime.now(timezone.utc).date().isoformat()
-    for user_ref in users[:package_count]:
+    for user_ref in users:
+        if added >= package_count:
+            break
         async with aiosqlite.connect(DB_FILE) as db:
             daily = await db.execute_fetchall(
                 "SELECT added_count FROM member_add_daily_usage "
@@ -3936,13 +3938,18 @@ async def run_member_add_order(order_id: int):
             added += 1
             async with aiosqlite.connect(DB_FILE) as db:
                 await db.execute(
+                    "DELETE FROM member_add_pool WHERE username = ?", (user_ref.lower(),)
+                )
+                await db.execute(
                     "INSERT INTO member_add_daily_usage (owner_id, usage_date, added_count) "
                     "VALUES (?, ?, 1) ON CONFLICT(owner_id, usage_date) "
                     "DO UPDATE SET added_count = added_count + 1", (profile_id, today)
                 )
                 await db.commit()
         except (UserAlreadyParticipantError,):
-            # User guruhda bor; buni xato deb sanamasdan keyingi userga o'tamiz.
+            async with aiosqlite.connect(DB_FILE) as db:
+                await db.execute("DELETE FROM member_add_pool WHERE username = ?", (user_ref.lower(),))
+                await db.commit()
             continue
         except (UserPrivacyRestrictedError, UserIdInvalidError, UsernameNotOccupiedError,
                 InputUserDeactivatedError, ChannelPrivateError) as exc:
@@ -3957,7 +3964,7 @@ async def run_member_add_order(order_id: int):
         except Exception as exc:
             failed += 1
             log.warning("Member-add xatosi %s: %s", user_ref, exc)
-        await asyncio.sleep(3 if not unlimited_member_add else 1)
+        await asyncio.sleep(1.0 if not unlimited_member_add else 0.25)
 
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(
@@ -4340,9 +4347,11 @@ async def create_member_add_order_from_pool(message: Message, state: FSMContext,
             await state.clear()
             _member_add_pending.pop(message.from_user.id, None)
             return
+        pool_count_row = await db.execute_fetchall("SELECT COUNT(*) FROM member_add_pool")
+        candidate_limit = min(50_000, int(pool_count_row[0][0]))
         pool_rows = await db.execute_fetchall(
             "SELECT position, username FROM member_add_pool ORDER BY position LIMIT ?",
-            (package_count,),
+            (candidate_limit,),
         )
         users = [str(row[1]) for row in pool_rows]
         if not users:
@@ -4361,10 +4370,6 @@ async def create_member_add_order_from_pool(message: Message, state: FSMContext,
         await db.executemany(
             "INSERT INTO member_add_users(order_id, position, username) VALUES (?, ?, ?)",
             [(order_id, position, username) for position, username in enumerate(users, 1)],
-        )
-        await db.executemany(
-            "DELETE FROM member_add_pool WHERE position = ?",
-            [(row[0],) for row in pool_rows],
         )
         await db.commit()
     await state.clear()
