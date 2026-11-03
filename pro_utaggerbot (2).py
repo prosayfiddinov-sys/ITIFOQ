@@ -222,6 +222,10 @@ class UserStatesGroup(StatesGroup):
     admin_member_add_price = State()
     admin_member_add_pool = State()
     admin_member_add_bonus = State()
+    admin_almaz_adjust = State()
+    admin_almaz_recipient = State()
+    admin_vip_user = State()
+    admin_vip_days = State()
     contest_channel        = State()
     contest_max_users      = State()
     contest_req_channels   = State()
@@ -421,6 +425,67 @@ async def init_db():
             PRIMARY KEY (owner_id, claim_date)
         )""")
         await db.execute("""
+        CREATE TABLE IF NOT EXISTS almaz_balances (
+            user_id TEXT PRIMARY KEY,
+            balance INTEGER NOT NULL DEFAULT 0 CHECK(balance >= 0),
+            updated_at TEXT NOT NULL
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS almaz_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            balance_after INTEGER NOT NULL,
+            operation TEXT NOT NULL,
+            source_user_id TEXT,
+            reference TEXT,
+            created_at TEXT NOT NULL
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS almaz_packages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            credit_count INTEGER NOT NULL UNIQUE,
+            almaz_price INTEGER NOT NULL CHECK(almaz_price >= 0),
+            active INTEGER NOT NULL DEFAULT 1
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS almaz_package_purchases (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            package_id INTEGER NOT NULL,
+            credit_count INTEGER NOT NULL,
+            almaz_price INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS vip_subscriptions (
+            user_id TEXT PRIMARY KEY,
+            expires_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'admin'
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS vip_prices (
+            days INTEGER PRIMARY KEY,
+            almaz_price INTEGER NOT NULL CHECK(almaz_price >= 0)
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS member_invite_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL,
+            user_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            detail TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(order_id, user_id)
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS member_invite_links (
+            invite_link TEXT PRIMARY KEY,
+            order_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )""")
+        await db.execute("""
         CREATE TABLE IF NOT EXISTS profile_clock_settings (
             user_id TEXT PRIMARY KEY,
             timezone TEXT NOT NULL,
@@ -450,6 +515,14 @@ async def init_db():
             position INTEGER PRIMARY KEY,
             username TEXT NOT NULL UNIQUE
         )""")
+        await db.executemany(
+            "INSERT OR IGNORE INTO almaz_packages(credit_count, almaz_price) VALUES (?, ?)",
+            [(500, 500), (1000, 1000), (2000, 2000)],
+        )
+        await db.executemany(
+            "INSERT OR IGNORE INTO vip_prices(days, almaz_price) VALUES (?, ?)",
+            [(7, 70), (30, 250), (90, 600)],
+        )
         try:
             await db.execute(
                 "ALTER TABLE scraped_users ADD COLUMN telegram_user_id TEXT"
@@ -722,17 +795,7 @@ def get_user_mention_name(user) -> str:
     username = str(getattr(user, "username", "") or "").strip().lstrip("@")
     if username:
         return f"@{username}"
-
-    display_name = get_display_name(user).strip()
-    if display_name and display_name.lower() not in {"deleted account", "none", "null"}:
-        return display_name.replace("#", "").strip()
-
-    return (
-        " ".join(filter(None, (
-            getattr(user, "first_name", None),
-            getattr(user, "last_name", None),
-        ))).strip() or f"Foydalanuvchi {getattr(user, 'id', '')}".strip()
-    )
+    return "•"
 
 
 def get_user_mention_entities(
@@ -864,7 +927,6 @@ async def run_bot_utag(chat_id: int, random_mode: bool):
     if not members:
         await bot.send_message(chat_id, "Hali guruhdan userlar yig'ilmadi.")
         return
-
     words = list(RANDOM_UTAG_WORDS)
     if random_mode:
         counts = _bot_group_word_counts.get(chat_id, {})
@@ -1168,7 +1230,11 @@ def get_main_keyboard(
     )
     kb.row(
         InlineKeyboardButton(text="💠 User Yig'ish", callback_data="btn_scrape"),
-        InlineKeyboardButton(text="💎 PRO obuna", callback_data="btn_pro_info")
+        InlineKeyboardButton(text="👑 VIP obuna", callback_data="vip_menu")
+    )
+    kb.row(
+        InlineKeyboardButton(text="💎 ALMAZ hamyon", callback_data="almaz_menu"),
+        InlineKeyboardButton(text="🛒 ALMAZ paketlari", callback_data="almaz_packages"),
     )
     kb.row(InlineKeyboardButton(text="👥 Guruhga a'zo qo'shish", callback_data="member_add"))
     kb.row(
@@ -1847,21 +1913,26 @@ async def cb_set_utag_speed(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "settings_buy_pro")
 async def cb_buy_pro(callback: CallbackQuery):
-    price = await get_pro_price()
+    vip_price = 250
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute("SELECT almaz_price FROM vip_prices WHERE days = 30") as cur:
+            row = await cur.fetchone()
+    if row:
+        vip_price = int(row[0])
     text = (
-        "💳 <b>PRO Tarif Sotib Olish</b>\n\n"
+        "👑 <b>VIP Tarif Sotib Olish</b>\n\n"
         "✅ uTag uchun reklama yo'q\n"
         "✅ Avto xabarda kunlik 150 ta limit yo'q\n"
         "✅ User terishda kunlik 500 ta limit yo'q\n"
         "✅ Avto javob, bio va boshqa PRO funksiyalari\n"
         "✅ Barcha tegishli sozlamalarda cheksiz foydalanish\n\n"
-        f"💰 Narx: <b>{price} Telegram Stars</b>\n"
+        f"💰 Narx: <b>{vip_price:,} ALMAZ</b>\n"
         "PRO muddat: <b>30 kun</b>"
     )
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(
-        text=f"⭐ {price} Stars bilan sotib olish",
-        callback_data="buy_pro_stars",
+        text=f"💎 {vip_price:,} ALMAZ bilan sotib olish",
+        callback_data="almaz_vip_buy:30",
     ))
     kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="btn_settings"))
     await callback.message.edit_text(text, reply_markup=kb.as_markup())
@@ -1954,6 +2025,25 @@ async def pre_checkout_clone(query: types.PreCheckoutQuery):
         )
         await query.answer(ok=valid, error_message=None if valid else "Buyurtma topilmadi yoki ishlatilgan.")
         return
+    if query.invoice_payload.startswith("almaz_topup:"):
+        parts = query.invoice_payload.split(":")
+        if len(parts) != 4:
+            await query.answer(ok=False, error_message="ALMAZ buyurtmasi noto'g'ri.")
+            return
+        async with aiosqlite.connect(DB_FILE) as db:
+            async with db.execute(
+                "SELECT user_id, amount, status FROM paid_feature_orders WHERE payload = ?",
+                (query.invoice_payload,),
+            ) as cur:
+                order = await cur.fetchone()
+        valid = bool(
+            order
+            and order[0] == str(query.from_user.id)
+            and order[1] == query.total_amount
+            and order[2] == "pending"
+        )
+        await query.answer(ok=valid, error_message=None if valid else "Buyurtma topilmadi yoki ishlatilgan.")
+        return
     if not query.invoice_payload.startswith("clone:"):
         await query.answer(ok=False, error_message="To'lov ma'lumotlari noto'g'ri.")
         return
@@ -1993,6 +2083,33 @@ async def clone_payment_success(message: Message, state: FSMContext):
         if cursor.rowcount != 1:
             await message.answer("PRO buyurtmasi topilmadi yoki to'lov qayta ishlangan.")
             return
+        await grant_pro(str(message.from_user.id), 30)
+        await message.answer(
+            "✅ To'lov qabul qilindi!\n"
+            "💎 Sizga 30 kunlik PRO tarif faollashtirildi."
+        )
+        return
+    if payment.invoice_payload.startswith("almaz_topup:"):
+        parts = payment.invoice_payload.split(":")
+        if len(parts) != 4:
+            await message.answer("ALMAZ buyurtmasi noto'g'ri.")
+            return
+        _, uid_text, almaz_text, _ = parts
+        async with aiosqlite.connect(DB_FILE) as db:
+            cursor = await db.execute(
+                "UPDATE paid_feature_orders SET status = 'paid', telegram_charge_id = ? "
+                "WHERE payload = ? AND user_id = ? AND amount = ? AND status = 'pending'",
+                (payment.telegram_payment_charge_id, payment.invoice_payload,
+                 str(message.from_user.id), payment.total_amount),
+            )
+            if cursor.rowcount != 1:
+                await db.rollback()
+                await message.answer("ALMAZ buyurtmasi topilmadi yoki qayta ishlangan.")
+                return
+            await db.commit()
+        await adjust_almaz_admin(uid_text, int(almaz_text), "almaz_topup")
+        await message.answer(f"✅ {int(almaz_text):,} ALMAZ hamyoningizga qo'shildi.")
+        return
     if payment.invoice_payload.startswith("member_add:"):
         parts = payment.invoice_payload.split(":")
         if len(parts) != 4:
@@ -3899,72 +4016,41 @@ async def run_member_add_order(order_id: int):
             "SELECT username FROM member_add_users WHERE order_id = ?", (order_id,)
         )
     users = [row[0] for row in db_users]
-    client = userbot_clients.get(str(profile_id))
-    if not client:
-        await bot.send_message(int(user_id), "❌ Tanlangan profil hozir ulangan emas.")
-        return
-
-    if not client.is_connected():
-        await client.connect()
     try:
-        target = await client.get_entity(target_chat)
+        chat = await bot.get_chat(target_chat)
     except Exception as exc:
         await bot.send_message(int(user_id), f"❌ Guruh topilmadi: {exc}")
         return
-
-    added = 0
-    failed = 0
-    today = datetime.now(timezone.utc).date().isoformat()
-    for user_ref in users:
-        if added >= package_count:
-            break
-        async with aiosqlite.connect(DB_FILE) as db:
-            daily = await db.execute_fetchall(
-                "SELECT added_count FROM member_add_daily_usage "
-                "WHERE owner_id = ? AND usage_date = ?", (profile_id, today)
-            )
-            used = int(daily[0][0]) if daily else 0
-        unlimited_member_add = (
-            await user_has_active_pro(user_id) or await get_member_add_credit(user_id) > 0
+    try:
+        invite = await bot.create_chat_invite_link(
+            chat_id=chat.id,
+            member_limit=min(max(int(package_count), 1), 99999),
+            creates_join_request=False,
         )
-        if not unlimited_member_add and used >= MEMBER_ADD_DAILY_LIMIT:
-            break
-        try:
-            user = await client.get_input_entity(user_ref)
-            if getattr(target, "broadcast", False) or getattr(target, "megagroup", False):
-                await client(InviteToChannelRequest(target, [user]))
-            else:
-                await client(AddChatUserRequest(chat_id=target.id, user_id=user, fwd_limit=0))
-            added += 1
-            async with aiosqlite.connect(DB_FILE) as db:
-                await db.execute(
-                    "DELETE FROM member_add_pool WHERE username = ?", (user_ref.lower(),)
-                )
-                await db.execute(
-                    "INSERT INTO member_add_daily_usage (owner_id, usage_date, added_count) "
-                    "VALUES (?, ?, 1) ON CONFLICT(owner_id, usage_date) "
-                    "DO UPDATE SET added_count = added_count + 1", (profile_id, today)
-                )
-                await db.commit()
-        except (UserAlreadyParticipantError,):
-            async with aiosqlite.connect(DB_FILE) as db:
-                await db.execute("DELETE FROM member_add_pool WHERE username = ?", (user_ref.lower(),))
-                await db.commit()
-            continue
-        except (UserPrivacyRestrictedError, UserIdInvalidError, UsernameNotOccupiedError,
-                InputUserDeactivatedError, ChannelPrivateError) as exc:
-            failed += 1
-            log.warning("Member-add xatosi %s: %s", user_ref, type(exc).__name__)
-        except PeerFloodError as exc:
-            failed += 1
-            await asyncio.sleep(getattr(exc, "seconds", 60) + 1)
-        except FloodWaitError as exc:
-            failed += 1
-            await asyncio.sleep(exc.seconds + 1)
-        except Exception as exc:
-            failed += 1
-            log.warning("Member-add xatosi %s: %s", user_ref, exc)
-        await asyncio.sleep(1.0 if not unlimited_member_add else 0.25)
+    except Exception as exc:
+        log.error("Taklif havolasi yaratishda xato order=%s: %s", order_id, exc)
+        await bot.send_message(int(user_id), f"❌ Taklif havolasi yaratilmadi: {exc}")
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute(
+                "UPDATE member_add_orders SET status='failed', failed_count=? WHERE id=?",
+                (len(users), order_id),
+            )
+            await db.commit()
+        return
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO member_invite_links(invite_link, order_id, created_at) "
+            "VALUES (?, ?, ?)",
+            (invite.invite_link, order_id, datetime.now(timezone.utc).isoformat()),
+        )
+        await db.commit()
+    await bot.send_message(
+        int(user_id),
+        "✅ Taklif havolasi tayyor.\n"
+        "Foydalanuvchilar havola orqali o‘zlari guruhga qo‘shiladi; faqat rozilik bildirganlar hisoblanadi.\n"
+        f"{invite.invite_link}",
+    )
+    added, failed = 0, 0
 
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(
@@ -4486,6 +4572,10 @@ def get_admin_keyboard() -> InlineKeyboardMarkup:
         kb.row(InlineKeyboardButton(text="📢 Kanallarni boshqarish", callback_data="admin_channels"))
         kb.row(InlineKeyboardButton(text="⭐ PRO Stars narxi", callback_data="admin_clone_settings"))
     kb.row(InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="admin_users"))
+    kb.row(
+        InlineKeyboardButton(text="💎 ALMAZ boshqarish", callback_data="admin_almaz"),
+        InlineKeyboardButton(text="👑 VIP boshqarish", callback_data="admin_vip"),
+    )
     kb.row(InlineKeyboardButton(text="⭐ PRO berish", callback_data="admin_give_pro"))
     kb.row(InlineKeyboardButton(text="🎉 Konkurs yaratish", callback_data="admin_contest_create"))
     kb.row(InlineKeyboardButton(text="🏆 Aktiv konkurslar", callback_data="admin_contests_list"))
@@ -6369,6 +6459,519 @@ async def pick_winner(contest_id: int):
         pass
 
 # ─────────────────────────────────────────────
+# ALMAZ WALLET, VIP AND INVITE ECONOMY
+# ─────────────────────────────────────────────
+ALMAZ_OPERATION_ADD = "admin_add"
+ALMAZ_OPERATION_REMOVE = "admin_remove"
+ALMAZ_OPERATION_TRANSFER = "transfer"
+ALMAZ_OPERATION_PACKAGE = "package_purchase"
+ALMAZ_OPERATION_VIP = "vip_purchase"
+
+
+async def ensure_almaz_account(user_id: int | str) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO almaz_balances(user_id, balance, updated_at) VALUES (?, 0, ?)",
+            (str(user_id), now),
+        )
+        await db.commit()
+
+
+async def get_almaz_balance(user_id: int | str) -> int:
+    await ensure_almaz_account(user_id)
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT balance FROM almaz_balances WHERE user_id = ?", (str(user_id),)
+        ) as cur:
+            row = await cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def almaz_transfer(
+    from_user_id: int | str,
+    to_user_id: int | str,
+    amount: int,
+    operation: str,
+    reference: str = "",
+) -> bool:
+    from_user_id, to_user_id = str(from_user_id), str(to_user_id)
+    if amount <= 0 or from_user_id == to_user_id:
+        return False
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        for uid in (from_user_id, to_user_id):
+            await db.execute(
+                "INSERT OR IGNORE INTO almaz_balances(user_id, balance, updated_at) VALUES (?, 0, ?)",
+                (uid, now),
+            )
+        async with db.execute(
+            "SELECT balance FROM almaz_balances WHERE user_id = ?", (from_user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        balance = int(row[0])
+        if balance < amount:
+            await db.rollback()
+            return False
+        await db.execute(
+            "UPDATE almaz_balances SET balance = balance - ?, updated_at = ? WHERE user_id = ?",
+            (amount, now, from_user_id),
+        )
+        await db.execute(
+            "UPDATE almaz_balances SET balance = balance + ?, updated_at = ? WHERE user_id = ?",
+            (amount, now, to_user_id),
+        )
+        async with db.execute(
+            "SELECT balance FROM almaz_balances WHERE user_id = ?", (from_user_id,)
+        ) as cur:
+            sender_balance = int((await cur.fetchone())[0])
+        async with db.execute(
+            "SELECT balance FROM almaz_balances WHERE user_id = ?", (to_user_id,)
+        ) as cur:
+            recipient_balance = int((await cur.fetchone())[0])
+        await db.execute(
+            "INSERT INTO almaz_transactions(user_id, amount, balance_after, operation, source_user_id, reference, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (from_user_id, -amount, sender_balance, operation, to_user_id, reference, now),
+        )
+        await db.execute(
+            "INSERT INTO almaz_transactions(user_id, amount, balance_after, operation, source_user_id, reference, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (to_user_id, amount, recipient_balance, operation, from_user_id, reference, now),
+        )
+        await db.commit()
+    return True
+
+
+async def adjust_almaz_admin(user_id: int | str, amount: int, operation: str = "") -> int:
+    user_id = str(user_id)
+    if amount == 0:
+        return await get_almaz_balance(user_id)
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        await db.execute(
+            "INSERT OR IGNORE INTO almaz_balances(user_id, balance, updated_at) VALUES (?, 0, ?)",
+            (user_id, now),
+        )
+        async with db.execute(
+            "SELECT balance FROM almaz_balances WHERE user_id = ?", (user_id,)
+        ) as cur:
+            current = int((await cur.fetchone())[0])
+        if current + amount < 0:
+            await db.rollback()
+            raise ValueError("Balans manfiy bo'lishi mumkin emas.")
+        new_balance = current + amount
+        await db.execute(
+            "UPDATE almaz_balances SET balance = ?, updated_at = ? WHERE user_id = ?",
+            (new_balance, now, user_id),
+        )
+        await db.execute(
+            "INSERT INTO almaz_transactions(user_id, amount, balance_after, operation, reference, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, amount, new_balance,
+             operation or (ALMAZ_OPERATION_ADD if amount > 0 else ALMAZ_OPERATION_REMOVE),
+             "admin_panel", now),
+        )
+        await db.commit()
+    return new_balance
+
+
+async def is_vip_active(user_id: int | str) -> bool:
+    now = datetime.now(timezone.utc)
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT expires_at FROM vip_subscriptions WHERE user_id = ?", (str(user_id),)
+        ) as cur:
+            row = await cur.fetchone()
+    if not row:
+        return False
+    try:
+        expires = datetime.fromisoformat(row[0])
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        return expires > now
+    except (TypeError, ValueError):
+        return False
+
+
+async def set_vip(user_id: int | str, days: int, extend: bool = True, source: str = "admin") -> str:
+    now = datetime.now(timezone.utc)
+    uid = str(user_id)
+    async with aiosqlite.connect(DB_FILE) as db:
+        base = now
+        if extend:
+            async with db.execute(
+                "SELECT expires_at FROM vip_subscriptions WHERE user_id = ?", (uid,)
+            ) as cur:
+                row = await cur.fetchone()
+            if row:
+                try:
+                    existing = datetime.fromisoformat(row[0])
+                    if existing.tzinfo is None:
+                        existing = existing.replace(tzinfo=timezone.utc)
+                    if existing > now:
+                        base = existing
+                except (TypeError, ValueError):
+                    pass
+        expires = base + timedelta(days=days)
+        await db.execute(
+            "INSERT INTO vip_subscriptions(user_id, expires_at, updated_at, source) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET expires_at=excluded.expires_at, "
+            "updated_at=excluded.updated_at, source=excluded.source",
+            (uid, expires.isoformat(), now.isoformat(), source),
+        )
+        await db.commit()
+    return expires.isoformat()
+
+
+@dp.message(Command("almaz"), F.chat.type == "private")
+async def cmd_almaz(message: Message):
+    await ensure_almaz_account(message.from_user.id)
+    await message.answer(
+        f"💎 <b>ALMAZ balansingiz:</b> {await get_almaz_balance(message.from_user.id):,}"
+    )
+
+
+@dp.message(Command("almaz_send"), F.chat.type == "private")
+async def cmd_almaz_send(message: Message):
+    parts = (message.text or "").split()
+    if len(parts) != 3 or not parts[2].isdigit():
+        await message.answer("Format: <code>/almaz_send ID MIQDOR</code>\nGuruh yoki kanal IDsi ham qabul qilinadi.")
+        return
+    try:
+        recipient = int(parts[1])
+        amount = int(parts[2])
+    except ValueError:
+        await message.answer("ID va miqdor raqam bo'lishi kerak.")
+        return
+    if await almaz_transfer(message.from_user.id, recipient, amount, ALMAZ_OPERATION_TRANSFER):
+        await message.answer(f"✅ {amount:,} ALMAZ yuborildi.")
+    else:
+        await message.answer("❌ Balans yetarli emas yoki recipient noto'g'ri.")
+
+
+def almaz_menu_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="💎 Balans", callback_data="almaz_balance"))
+    kb.row(InlineKeyboardButton(text="➕ ALMAZ sotib olish", callback_data="almaz_topup"))
+    kb.row(InlineKeyboardButton(text="👥 Paket xarid qilish", callback_data="almaz_packages"))
+    kb.row(InlineKeyboardButton(text="👑 VIP sotib olish", callback_data="almaz_vip"))
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="start"))
+    return kb.as_markup()
+
+
+@dp.callback_query(F.data == "almaz_menu")
+async def cb_almaz_menu(callback: CallbackQuery):
+    await callback.message.edit_text(
+        f"💎 <b>ALMAZ hamyon</b>\nBalans: <b>{await get_almaz_balance(callback.from_user.id):,}</b> ALMAZ\n\n"
+        "ALMAZni to‘ldirish, paket sotib olish va kirishni boshqaring.",
+        reply_markup=almaz_menu_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "vip_menu")
+async def cb_vip_menu(callback: CallbackQuery):
+    active = await is_vip_active(callback.from_user.id)
+    await callback.message.edit_text(
+        "👑 <b>VIP obuna</b>\n"
+        + ("Holat: <b>faol</b>\n" if active else "Holat: <b>faol emas</b>\n")
+        + "VIPni faqat ALMAZ bilan sotib oling.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👑 VIP tariflar", callback_data="almaz_vip")],
+            [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="start")],
+        ]),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "almaz_topup")
+async def cb_almaz_topup(callback: CallbackQuery):
+    kb = InlineKeyboardBuilder()
+    for stars, almaz in ((50, 50), (100, 100), (250, 250), (500, 500)):
+        kb.row(InlineKeyboardButton(
+            text=f"{stars} Stars — {almaz} ALMAZ",
+            callback_data=f"almaz_topup_buy:{stars}:{almaz}",
+        ))
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="almaz_menu"))
+    await callback.message.edit_text(
+        "➕ <b>ALMAZ sotib olish</b>\nTelegram Stars bilan alohida ALMAZ hamyonini to‘ldiring.",
+        reply_markup=kb.as_markup(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("almaz_topup_buy:"))
+async def cb_almaz_topup_buy(callback: CallbackQuery):
+    _, stars_text, almaz_text = callback.data.split(":")
+    stars, almaz = int(stars_text), int(almaz_text)
+    order_id = os.urandom(12).hex()
+    payload = f"almaz_topup:{callback.from_user.id}:{almaz}:{order_id}"
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT INTO paid_feature_orders(id, user_id, payload, feature, amount, status, created_at) "
+            "VALUES (?, ?, ?, 'almaz_topup', ?, 'pending', ?)",
+            (order_id, str(callback.from_user.id), payload, stars, datetime.now(timezone.utc).isoformat()),
+        )
+        await db.commit()
+    await callback.message.answer_invoice(
+        title="ALMAZ to'ldirish",
+        description=f"{almaz:,} ALMAZ balansga qo'shiladi.",
+        payload=payload,
+        provider_token="",
+        currency="XTR",
+        prices=[LabeledPrice(label=f"{almaz:,} ALMAZ", amount=stars)],
+        start_parameter="almaz-topup",
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "almaz_balance")
+async def cb_almaz_balance(callback: CallbackQuery):
+    await callback.answer(
+        f"Balansingiz: {await get_almaz_balance(callback.from_user.id):,} ALMAZ",
+        show_alert=True,
+    )
+
+
+@dp.callback_query(F.data == "almaz_packages")
+async def cb_almaz_packages(callback: CallbackQuery):
+    async with aiosqlite.connect(DB_FILE) as db:
+        rows = await db.execute_fetchall(
+            "SELECT id, credit_count, almaz_price FROM almaz_packages "
+            "WHERE active = 1 AND almaz_price >= 0 ORDER BY credit_count"
+        )
+    kb = InlineKeyboardBuilder()
+    for package_id, credits, price in rows:
+        kb.row(InlineKeyboardButton(
+            text=f"{int(credits):,} kredit — {int(price):,} ALMAZ",
+            callback_data=f"almaz_buy:{package_id}",
+        ))
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="start"))
+    await callback.message.edit_text(
+        "💎 <b>Taklif kredit paketlari</b>\nALMAZ balansidan xarid qilinadi.",
+        reply_markup=kb.as_markup(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("almaz_buy:"))
+async def cb_almaz_buy(callback: CallbackQuery):
+    package_id = int(callback.data.split(":", 1)[1])
+    uid = str(callback.from_user.id)
+    purchase_id = os.urandom(12).hex()
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute(
+            "SELECT credit_count, almaz_price FROM almaz_packages WHERE id = ? AND active = 1",
+            (package_id,),
+        ) as cur:
+            package = await cur.fetchone()
+        if not package:
+            await db.rollback()
+            await callback.answer("Paket topilmadi.", show_alert=True)
+            return
+        credits, price = int(package[0]), int(package[1])
+        await db.execute(
+            "INSERT OR IGNORE INTO almaz_balances(user_id, balance, updated_at) VALUES (?, 0, ?)",
+            (uid, now),
+        )
+        async with db.execute(
+            "SELECT balance FROM almaz_balances WHERE user_id = ?", (uid,)
+        ) as cur:
+            balance = int((await cur.fetchone())[0])
+        if balance < price:
+            await db.rollback()
+            await callback.answer("ALMAZ yetarli emas.", show_alert=True)
+            return
+        await db.execute(
+            "UPDATE almaz_balances SET balance = balance - ?, updated_at = ? WHERE user_id = ?",
+            (price, now, uid),
+        )
+        await db.execute(
+            "INSERT OR IGNORE INTO member_add_credits(owner_id, remaining_count) VALUES (?, 0)", (uid,)
+        )
+        await db.execute(
+            "UPDATE member_add_credits SET remaining_count = remaining_count + ? WHERE owner_id = ?",
+            (credits, uid),
+        )
+        await db.execute(
+            "INSERT INTO almaz_package_purchases(id, user_id, package_id, credit_count, almaz_price, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (purchase_id, uid, package_id, credits, price, now),
+        )
+        await db.execute(
+            "INSERT INTO almaz_transactions(user_id, amount, balance_after, operation, reference, created_at) "
+            "VALUES (?, ?, (SELECT balance FROM almaz_balances WHERE user_id = ?), ?, ?, ?)",
+            (uid, -price, uid, ALMAZ_OPERATION_PACKAGE, purchase_id, now),
+        )
+        await db.commit()
+    await callback.answer(f"Sotib olindi: +{credits:,} taklif krediti.", show_alert=True)
+
+
+@dp.callback_query(F.data == "almaz_vip")
+async def cb_almaz_vip(callback: CallbackQuery):
+    async with aiosqlite.connect(DB_FILE) as db:
+        rows = await db.execute_fetchall(
+            "SELECT days, almaz_price FROM vip_prices WHERE almaz_price >= 0 ORDER BY days"
+        )
+    kb = InlineKeyboardBuilder()
+    for days, price in rows:
+        kb.row(InlineKeyboardButton(
+            text=f"VIP {days} kun — {price:,} ALMAZ",
+            callback_data=f"almaz_vip_buy:{days}",
+        ))
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="start"))
+    await callback.message.edit_text("👑 VIP muddatini tanlang:", reply_markup=kb.as_markup())
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("almaz_vip_buy:"))
+async def cb_almaz_vip_buy(callback: CallbackQuery):
+    days = int(callback.data.split(":", 1)[1])
+    uid = str(callback.from_user.id)
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute("SELECT almaz_price FROM vip_prices WHERE days = ?", (days,)) as cur:
+            row = await cur.fetchone()
+    if not row:
+        await callback.answer("VIP tarif topilmadi.", show_alert=True)
+        return
+    price = int(row[0])
+    if await get_almaz_balance(uid) < price:
+        await callback.answer("ALMAZ yetarli emas.", show_alert=True)
+        return
+    purchase_id = os.urandom(8).hex()
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute(
+            "SELECT balance FROM almaz_balances WHERE user_id = ?", (uid,)
+        ) as cur:
+            balance = int((await cur.fetchone())[0])
+        if balance < price:
+            await db.rollback()
+            await callback.answer("ALMAZ yetarli emas.", show_alert=True)
+            return
+        await db.execute(
+            "UPDATE almaz_balances SET balance = balance - ?, updated_at = ? WHERE user_id = ?",
+            (price, datetime.now(timezone.utc).isoformat(), uid),
+        )
+        await db.commit()
+    expires = await set_vip(uid, days, True, "almaz_purchase")
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT INTO almaz_transactions(user_id, amount, balance_after, operation, reference, created_at) "
+            "VALUES (?, ?, (SELECT balance FROM almaz_balances WHERE user_id = ?), ?, ?, ?)",
+            (uid, -price, uid, ALMAZ_OPERATION_VIP, purchase_id, datetime.now(timezone.utc).isoformat()),
+        )
+        await db.commit()
+    await callback.answer(f"VIP faollashtirildi: {days} kun.", show_alert=True)
+
+
+@dp.callback_query(F.data == "admin_almaz")
+async def cb_admin_almaz(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Faqat owner uchun", show_alert=True)
+        return
+    await state.set_state(UserStatesGroup.admin_almaz_recipient)
+    await callback.message.edit_text(
+        "💎 ALMAZni qo‘shish/ayirish uchun <code>UserID miqdor</code> yuboring.\n"
+        "Ayirish uchun musbat miqdordan oldin minus yozing: <code>123456 -50</code>"
+    )
+    await callback.answer()
+
+
+@dp.message(StateFilter(UserStatesGroup.admin_almaz_recipient), F.text)
+async def admin_almaz_adjust(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2:
+        await message.answer("Format: <code>UserID miqdor</code>")
+        return
+    try:
+        uid = str(int(parts[0]))
+        amount = int(parts[1])
+        new_balance = await adjust_almaz_admin(uid, amount)
+        await state.clear()
+        await message.answer(f"✅ {uid} balansi: <b>{new_balance:,}</b> ALMAZ")
+    except (ValueError, TypeError) as exc:
+        await message.answer(f"❌ {exc}")
+
+
+@dp.callback_query(F.data == "admin_vip")
+async def cb_admin_vip(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Faqat owner uchun", show_alert=True)
+        return
+    await state.set_state(UserStatesGroup.admin_vip_user)
+    await callback.message.edit_text("👑 VIP berish uchun <code>UserID kun</code> yuboring. Uzaytirish uchun musbat kun.")
+    await callback.answer()
+
+
+@dp.message(StateFilter(UserStatesGroup.admin_vip_user), F.text)
+async def admin_vip_set(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2:
+        await message.answer("Format: <code>UserID kun</code>")
+        return
+    try:
+        uid = str(int(parts[0]))
+        days = int(parts[1])
+        if days <= 0 or days > 3650:
+            raise ValueError("Kun 1 dan 3650 gacha bo'lishi kerak.")
+        expires = await set_vip(uid, days, True, "admin")
+        await state.clear()
+        await message.answer(f"✅ VIP berildi. Tugash: {expires[:10]}")
+    except (ValueError, TypeError) as exc:
+        await message.answer(f"❌ {exc}")
+
+
+async def expire_vip_subscriptions():
+    while True:
+        now = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute(
+                "DELETE FROM vip_subscriptions WHERE expires_at <= ?", (now,)
+            )
+            await db.commit()
+        await asyncio.sleep(3600)
+
+
+@dp.chat_member()
+async def track_invited_member(event: types.ChatMemberUpdated):
+    if event.new_chat_member.status not in ("member", "administrator", "creator"):
+        return
+    if event.old_chat_member.status in ("member", "administrator", "creator"):
+        return
+    invite_link = getattr(event, "invite_link", None)
+    if not invite_link or not invite_link.invite_link:
+        return
+    async with aiosqlite.connect(DB_FILE) as db:
+        row = await db.execute_fetchall(
+            "SELECT order_id FROM member_invite_links WHERE invite_link = ?",
+            (invite_link.invite_link,),
+        )
+        if not row:
+            return
+        order_id = int(row[0][0])
+        await db.execute(
+            "INSERT OR IGNORE INTO member_invite_results "
+            "(order_id, user_id, status, detail, created_at) VALUES (?, ?, 'joined', ?, ?)",
+            (order_id, str(event.new_chat_member.user.id), "Taklif havolasidan rozilik bilan qo'shildi",
+             datetime.now(timezone.utc).isoformat()),
+        )
+        cursor = await db.execute(
+            "UPDATE member_add_orders SET added_count = (SELECT COUNT(*) FROM member_invite_results "
+            "WHERE order_id = ? AND status = 'joined') WHERE id = ? AND status != 'stopped'",
+            (order_id, order_id),
+        )
+        await db.commit()
+
+
 # STARTUP: userbot sessiyalarini yuklash
 # ─────────────────────────────────────────────
 async def load_existing_sessions():
@@ -6548,6 +7151,7 @@ async def main():
         register_common_keyboard_buttons()
         # Clone bots are disabled.
         asyncio.create_task(pro_expiration_checker())
+        asyncio.create_task(expire_vip_subscriptions())
         asyncio.create_task(bio_watcher())
         await dp.start_polling(primary_bot, skip_updates=True)
     finally:
