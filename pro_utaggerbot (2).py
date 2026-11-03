@@ -35,6 +35,7 @@ from telethon.errors import (
     SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError,
     PasswordHashInvalidError, UserAlreadyParticipantError, UserIdInvalidError,
     UsernameNotOccupiedError, InputUserDeactivatedError, ChannelPrivateError,
+    SendCodeUnavailableError,
 )
 from telethon.tl.types import (
     UserStatusOnline, Chat, DocumentAttributeCustomEmoji, InputStickerSetShortName,
@@ -50,6 +51,7 @@ from telethon.tl.functions.messages import (
     GetCustomEmojiDocumentsRequest,
     GetStickerSetRequest,
 )
+from telethon.tl.functions.auth import ResendCodeRequest
 from telethon.tl.functions.channels import InviteToChannelRequest, GetParticipantsRequest
 from telethon.tl.functions.account import UpdateProfileRequest
 from telethon.tl.functions.users import GetFullUserRequest, GetUsersRequest
@@ -218,6 +220,8 @@ class UserStatesGroup(StatesGroup):
     member_add_admin       = State()
     member_add_users       = State()
     admin_member_add_price = State()
+    admin_member_add_pool = State()
+    admin_member_add_bonus = State()
     contest_channel        = State()
     contest_max_users      = State()
     contest_req_channels   = State()
@@ -410,6 +414,13 @@ async def init_db():
             remaining_count INTEGER NOT NULL DEFAULT 0
         )""")
         await db.execute("""
+        CREATE TABLE IF NOT EXISTS member_add_daily_bonus (
+            owner_id TEXT NOT NULL,
+            claim_date TEXT NOT NULL,
+            claimed_count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (owner_id, claim_date)
+        )""")
+        await db.execute("""
         CREATE TABLE IF NOT EXISTS profile_clock_settings (
             user_id TEXT PRIMARY KEY,
             timezone TEXT NOT NULL,
@@ -433,6 +444,11 @@ async def init_db():
             position INTEGER NOT NULL,
             username TEXT NOT NULL,
             PRIMARY KEY (order_id, position)
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS member_add_pool (
+            position INTEGER PRIMARY KEY,
+            username TEXT NOT NULL UNIQUE
         )""")
         try:
             await db.execute(
@@ -2174,7 +2190,7 @@ async def process_phone_login(message: Message, state: FSMContext, phone: str):
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     try:
         await client.connect()
-        sent = await client.send_code_request(phone)
+        sent = await asyncio.wait_for(client.send_code_request(phone), timeout=30)
         delivery_hint = get_login_code_delivery_hint(sent)
         await state.update_data(
             temp_client=client, phone=phone,
@@ -2199,6 +2215,15 @@ async def process_phone_login(message: Message, state: FSMContext, phone: str):
         await message.answer(
             f"⏳ Telegram yangi kod yuborishdan oldin {exc.seconds} soniya kutishni so'radi. "
             "Keyin telefon raqamini qayta yuboring."
+        )
+    except asyncio.TimeoutError:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        await message.answer(
+            "❌ Telegram kod yuborish so'roviga 30 soniya ichida javob bermadi. "
+            "Internet/API_ID va API_HASH ni tekshirib, raqamni qayta yuboring."
         )
     except Exception as exc:
         log.exception("Telegram login kodi so'ralmadi")
@@ -2257,6 +2282,8 @@ async def submit_login_code(
         return "expired", "⚠️ Sessiya eskirgan. Akkauntni qaytadan ulang."
 
     try:
+        if not client.is_connected():
+            await client.connect()
         await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
     except SessionPasswordNeededError:
         await clear_login_code_keyboard(state)
@@ -2270,9 +2297,16 @@ async def submit_login_code(
         await client.disconnect()
         await state.clear()
         return "expired", "⌛ Kod muddati tugadi. Akkauntni qaytadan ulashni boshlang."
-    except Exception:
+    except Exception as exc:
         log.exception("Telegram tasdiqlash kodini tekshirishda xato")
-        return "retry", "❌ Kodni tekshirib bo'lmadi. Qaytadan urinib ko'ring."
+        error_name = type(exc).__name__
+        if error_name == "PhoneCodeHashEmptyError":
+            return "retry", "❌ Login sessiyasi eskirgan. Akkountni qaytadan ulang."
+        if error_name == "FloodWaitError":
+            wait_seconds = getattr(exc, "seconds", None)
+            wait_text = f" {wait_seconds} soniyadan keyin" if wait_seconds else " Keyinroq"
+            return "retry", f"❌ Telegram haddan tashqari ko'p urinishni qayd qildi.{wait_text} urinib ko'ring."
+        return "retry", f"❌ Telegram kodni qabul qilmadi ({error_name}). Qayta kiriting."
 
     await clear_login_code_keyboard(state)
     await finalize_login(user_id, client, phone, state)
@@ -2370,7 +2404,22 @@ async def login_code_keypad_input(callback: CallbackQuery, state: FSMContext):
             await callback.answer("Login sessiyasi tugagan. Qaytadan boshlang.", show_alert=True)
             return
         try:
-            sent = await client.send_code_request(phone)
+            if not client.is_connected():
+                await client.connect()
+            phone_code_hash = data.get("phone_code_hash") or ""
+            try:
+                sent = await asyncio.wait_for(
+                    client(ResendCodeRequest(
+                        phone_number=phone,
+                        phone_code_hash=phone_code_hash,
+                    )),
+                    timeout=30,
+                )
+            except SendCodeUnavailableError:
+                sent = await asyncio.wait_for(
+                    client.send_code_request(phone),
+                    timeout=30,
+                )
             delivery_hint = get_login_code_delivery_hint(sent)
             resend_count = int(data.get("resend_count", 0)) + 1
             await state.update_data(
@@ -2381,13 +2430,19 @@ async def login_code_keypad_input(callback: CallbackQuery, state: FSMContext):
             )
             await callback.message.edit_text(
                 login_code_prompt("", delivery_hint)
-                + f"\n\n🔄 Qayta so'raldi: {resend_count}",
+                + f"\n\n🔄 {resend_count}-kod qayta so'raldi. "
+                "Telegram bergan oxirgi kodni yuboring.",
                 reply_markup=get_login_code_keyboard()
             )
             await callback.answer("Yangi kod so'raldi.")
         except FloodWaitError as exc:
             await callback.answer(
                 f"Telegram qayta urinishdan oldin {exc.seconds} soniya kutishni so'radi.",
+                show_alert=True
+            )
+        except asyncio.TimeoutError:
+            await callback.answer(
+                "Telegram kodni qayta yuborish uchun javob bermadi. 30 soniyadan keyin urinib ko'ring.",
                 show_alert=True
             )
         except Exception as exc:
@@ -3679,6 +3734,7 @@ MEMBER_ADD_DAILY_LIMIT = 20
 MEMBER_ADD_TRIAL_DAYS = 5
 MEMBER_ADD_USD_PER_STAR = 0.013
 MEMBER_ADD_RUB_PER_USD = 90
+MEMBER_ADD_DAILY_BONUS = 20
 MEMBER_ADD_UZS_PER_USD = 12900
 _member_add_pending: dict[int, dict] = {}
 _member_add_tasks: dict[int, asyncio.Task] = {}
@@ -3766,7 +3822,7 @@ def parse_member_add_users(text: str) -> list[str]:
     return values
 
 
-def get_member_add_packages_keyboard() -> InlineKeyboardMarkup:
+def get_member_add_packages_keyboard(daily_bonus: int = MEMBER_ADD_DAILY_BONUS) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(
         text=f"📆 Kunlik limit: {MEMBER_ADD_DAILY_LIMIT} ta",
@@ -3775,10 +3831,49 @@ def get_member_add_packages_keyboard() -> InlineKeyboardMarkup:
     for count in MEMBER_ADD_PACKAGES:
         kb.row(InlineKeyboardButton(
             text=f"👥 {count:,} azo",
-            callback_data=f"member_add_purchase:{count}",
+            callback_data=f"member_add_package:{count}",
         ))
+    kb.row(InlineKeyboardButton(
+        text=f"🎁 Kunlik bonus: {daily_bonus} azo",
+        callback_data="member_add_daily_bonus",
+    ))
     kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="start"))
     return kb.as_markup()
+
+
+@dp.callback_query(F.data == "member_add_daily_bonus")
+async def cb_member_add_daily_bonus(callback: CallbackQuery):
+    owner_id = str(callback.from_user.id)
+    claim_date = datetime.now(timezone.utc).date().isoformat()
+    daily_bonus = await get_member_add_daily_bonus()
+    async with aiosqlite.connect(DB_FILE) as db:
+        row = await db.execute_fetchall(
+            "SELECT claimed_count FROM member_add_daily_bonus WHERE owner_id = ? AND claim_date = ?",
+            (owner_id, claim_date),
+        )
+        if row:
+            await callback.answer("Bugungi bonus allaqachon olingan.", show_alert=True)
+            return
+        await db.execute(
+            "INSERT INTO member_add_daily_bonus(owner_id, claim_date, claimed_count) "
+            "VALUES (?, ?, 1)",
+            (owner_id, claim_date),
+        )
+        await db.execute(
+            "INSERT INTO member_add_credits(owner_id, remaining_count) VALUES (?, ?) "
+            "ON CONFLICT(owner_id) DO UPDATE "
+            "SET remaining_count = remaining_count + excluded.remaining_count",
+            (owner_id, daily_bonus),
+        )
+        await db.commit()
+        credit_row = await db.execute_fetchall(
+            "SELECT remaining_count FROM member_add_credits WHERE owner_id = ?", (owner_id,)
+        )
+    balance = int(credit_row[0][0]) if credit_row else daily_bonus
+    await callback.answer(
+        f"🎁 Bonus olindi: +{daily_bonus} azo. Jami kredit: {balance}",
+        show_alert=True,
+    )
 
 
 async def get_member_add_prices() -> dict[int, int]:
@@ -3886,15 +3981,148 @@ async def run_member_add_order(order_id: int):
     )
 
 
-def get_admin_member_add_keyboard(prices: dict[int, int]) -> InlineKeyboardMarkup:
+def get_admin_member_add_keyboard(
+    prices: dict[int, int], daily_bonus: int = MEMBER_ADD_DAILY_BONUS
+) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for count in MEMBER_ADD_PACKAGES:
         kb.row(InlineKeyboardButton(
             text=f"{count:,} azo - {format_member_add_price(prices[count])}",
             callback_data=f"admin_member_price:{count}",
         ))
+    kb.row(
+        InlineKeyboardButton(text="📥 Admin bazasini yuklash", callback_data="admin_member_pool_import"),
+        InlineKeyboardButton(text="🗑 Bazani tozalash", callback_data="admin_member_pool_clear"),
+    )
+    kb.row(InlineKeyboardButton(text="📊 Admin baza soni", callback_data="admin_member_pool_count"))
+    kb.row(InlineKeyboardButton(
+        text=f"🎁 Kunlik bonus: {daily_bonus} azo",
+        callback_data="admin_member_bonus",
+    ))
     kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin_panel"))
     return kb.as_markup()
+
+
+async def get_member_add_pool_count() -> int:
+    async with aiosqlite.connect(DB_FILE) as db:
+        row = await db.execute_fetchall("SELECT COUNT(*) FROM member_add_pool")
+    return int(row[0][0]) if row else 0
+
+
+async def get_member_add_daily_bonus() -> int:
+    async with aiosqlite.connect(DB_FILE) as db:
+        row = await db.execute_fetchall(
+            "SELECT value FROM bot_settings WHERE key = 'member_add_daily_bonus'"
+        )
+    try:
+        return max(0, min(50_000, int(row[0][0])))
+    except (IndexError, TypeError, ValueError):
+        return MEMBER_ADD_DAILY_BONUS
+
+
+@dp.callback_query(F.data == "admin_member_bonus")
+async def cb_admin_member_bonus(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Faqat owner uchun", show_alert=True)
+        return
+    bonus = await get_member_add_daily_bonus()
+    await state.set_state(UserStatesGroup.admin_member_add_bonus)
+    await callback.message.edit_text(
+        f"🎁 Kunlik bonus miqdorini raqamda yuboring.\nHozirgi bonus: <b>{bonus}</b> azo."
+    )
+    await callback.answer()
+
+
+@dp.message(StateFilter(UserStatesGroup.admin_member_add_bonus), F.text)
+async def admin_member_bonus_input(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        bonus = int(message.text.strip().replace(" ", ""))
+        if not 0 <= bonus <= 50_000:
+            raise ValueError
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute(
+                "INSERT INTO bot_settings(key, value) VALUES ('member_add_daily_bonus', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(bonus),),
+            )
+            await db.commit()
+        await state.clear()
+        await message.answer(f"✅ Kunlik bonus <b>{bonus}</b> azoga sozlandi.")
+    except ValueError:
+        await message.answer("0 dan 50,000 gacha butun son yuboring.")
+
+
+@dp.callback_query(F.data == "admin_member_pool_import")
+async def cb_admin_member_pool_import(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Faqat owner uchun", show_alert=True)
+        return
+    await state.set_state(UserStatesGroup.admin_member_add_pool)
+    await callback.message.edit_text(
+        "📥 Admin baza faylini yoki xabarni yuboring.\n"
+        ".txt fayl bo'lishi mumkin.\n"
+        "Har bir qatorda @username, ID yoki t.me havola bo'lsin.\n"
+        "Maksimum: <b>50,000 ta</b>."
+    )
+    await callback.answer()
+
+
+@dp.message(StateFilter(UserStatesGroup.admin_member_add_pool))
+async def admin_member_pool_input(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    users = await extract_member_add_users(message)
+    if not users:
+        await message.answer("❌ Bazada username yoki ID topilmadi.")
+        return
+    current = await get_member_add_pool_count()
+    remaining = max(0, 50_000 - current)
+    selected = users[:remaining]
+    async with aiosqlite.connect(DB_FILE) as db:
+        existing = await db.execute_fetchall("SELECT username FROM member_add_pool")
+        known = {str(row[0]).lower() for row in existing}
+        new_users = []
+        for username in selected:
+            key = username.lower()
+            if key not in known:
+                known.add(key)
+                new_users.append(username)
+        start = int((await db.execute_fetchall("SELECT COALESCE(MAX(position), 0) FROM member_add_pool"))[0][0])
+        await db.executemany(
+            "INSERT INTO member_add_pool(position, username) VALUES (?, ?)",
+            [(start + index, username) for index, username in enumerate(new_users, 1)],
+        )
+        await db.commit()
+    total = await get_member_add_pool_count()
+    await state.clear()
+    await message.answer(
+        f"✅ Admin baza yangilandi.\nBazadagi userlar: <b>{total:,}</b> / 50,000"
+        + ("\n\n⚠️ Limitdan oshgan userlar bazaga qo'shilmadi." if len(users) > remaining else "")
+    )
+
+
+@dp.callback_query(F.data == "admin_member_pool_count")
+async def cb_admin_member_pool_count(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Faqat owner uchun", show_alert=True)
+        return
+    await callback.answer(
+        f"Admin bazasida {await get_member_add_pool_count():,} ta profil bor.",
+        show_alert=True,
+    )
+
+
+@dp.callback_query(F.data == "admin_member_pool_clear")
+async def cb_admin_member_pool_clear(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Faqat owner uchun", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("DELETE FROM member_add_pool")
+        await db.commit()
+    await callback.answer("Admin baza tozalandi.", show_alert=True)
 
 
 @dp.callback_query(F.data == "admin_member_add")
@@ -3903,10 +4131,11 @@ async def cb_admin_member_add(callback: CallbackQuery):
         await callback.answer("Faqat owner uchun", show_alert=True)
         return
     prices = await get_member_add_prices()
+    daily_bonus = await get_member_add_daily_bonus()
     await callback.message.edit_text(
         "👥 <b>A'zo qo'shish paketlari</b>\n"
         f"Kunlik limit: <b>{MEMBER_ADD_DAILY_LIMIT} ta</b>\nPaket narxini o'zgartirish uchun boshing:",
-        reply_markup=get_admin_member_add_keyboard(prices),
+        reply_markup=get_admin_member_add_keyboard(prices, daily_bonus),
     )
 
 
@@ -3946,7 +4175,8 @@ async def admin_member_add_price_input(message: Message, state: FSMContext):
             f"{format_member_add_price(price)}"
         )
         prices = await get_member_add_prices()
-        await message.answer("👥 Paketlar:", reply_markup=get_admin_member_add_keyboard(prices))
+        daily_bonus = await get_member_add_daily_bonus()
+        await message.answer("👥 Paketlar:", reply_markup=get_admin_member_add_keyboard(prices, daily_bonus))
     except ValueError:
         await message.answer("Faqat 0 yoki musbat butun son kiriting.")
 
@@ -3963,7 +4193,8 @@ async def cb_member_add_start(callback: CallbackQuery):
         lines.append("🆓 Sinov faolligi: kuniga 20 ta, 5 kun.")
     for count in MEMBER_ADD_PACKAGES:
         lines.append(f"• {count:,} azo - <b>{format_member_add_price(prices[count])}</b>")
-    await callback.message.edit_text("\n".join(lines), reply_markup=get_member_add_packages_keyboard())
+    daily_bonus = await get_member_add_daily_bonus()
+    await callback.message.edit_text("\n".join(lines), reply_markup=get_member_add_packages_keyboard(daily_bonus))
 
 
 @dp.callback_query(F.data == "member_add_limit")
@@ -4083,11 +4314,71 @@ async def member_add_admin_input(message: Message, state: FSMContext):
         return
     pending = _member_add_pending.setdefault(message.from_user.id, {})
     pending["invite_profile"] = matched_id
+    pool_count = await get_member_add_pool_count()
+    if pool_count > 0:
+        await create_member_add_order_from_pool(message, state, pending)
+        return
     await state.set_state(UserStatesGroup.member_add_users)
     await message.answer(
         "Userlar ro'yxatini yuboring, reply qiling yoki .txt fayl tashlang:\n"
         "Har bir user: @username, user ID yoki t.me havola bo'lishi mumkin."
     )
+
+
+async def create_member_add_order_from_pool(message: Message, state: FSMContext, pending: dict):
+    package_count = int(pending["package_count"])
+    profile_id = str(pending["invite_profile"])
+    today = datetime.now(timezone.utc).date().isoformat()
+    async with aiosqlite.connect(DB_FILE) as db:
+        daily = await db.execute_fetchall(
+            "SELECT added_count FROM member_add_daily_usage WHERE owner_id = ? AND usage_date = ?",
+            (profile_id, today),
+        )
+        used = int(daily[0][0]) if daily else 0
+        if used >= MEMBER_ADD_DAILY_LIMIT:
+            await message.answer("❌ Bu profilning bugungi limitiga yetildi.")
+            await state.clear()
+            _member_add_pending.pop(message.from_user.id, None)
+            return
+        pool_rows = await db.execute_fetchall(
+            "SELECT position, username FROM member_add_pool ORDER BY position LIMIT ?",
+            (package_count,),
+        )
+        users = [str(row[1]) for row in pool_rows]
+        if not users:
+            await message.answer("❌ Admin baza bo'sh. Admin paneldan userlarni yuklang.")
+            await state.clear()
+            _member_add_pending.pop(message.from_user.id, None)
+            return
+        cursor = await db.execute(
+            "INSERT INTO member_add_orders "
+            "(user_id, package_count, target_chat, invite_profile, status, created_at) "
+            "VALUES (?, ?, ?, ?, 'queued', ?)",
+            (str(message.from_user.id), package_count, pending["target_chat"], profile_id,
+             datetime.now(timezone.utc).isoformat()),
+        )
+        order_id = cursor.lastrowid
+        await db.executemany(
+            "INSERT INTO member_add_users(order_id, position, username) VALUES (?, ?, ?)",
+            [(order_id, position, username) for position, username in enumerate(users, 1)],
+        )
+        await db.executemany(
+            "DELETE FROM member_add_pool WHERE position = ?",
+            [(row[0],) for row in pool_rows],
+        )
+        await db.commit()
+    await state.clear()
+    _member_add_pending.pop(message.from_user.id, None)
+    stop_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="⏹ A'zo qo'shishni to'xtatish", callback_data="member_add_stop")
+    ]])
+    await message.answer(
+        f"✅ Admin bazadan buyurtma yaratildi.\nUserlar: <b>{len(users)}</b> ta\n"
+        "A'zo qo'shish boshlandi.",
+        reply_markup=stop_keyboard,
+    )
+    task = asyncio.create_task(run_member_add_order(order_id))
+    _member_add_tasks[message.from_user.id] = task
 
 
 async def extract_member_add_users(message: Message) -> list[str]:

@@ -9,7 +9,7 @@ services:
     healthCheckPath: /
     envVars:
       - key: API_ID
-        value: "38640395"
+        sync: false
       - key: API_HASH
         sync: false
       - key: BOT_TOKEN
