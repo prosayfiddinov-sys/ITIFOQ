@@ -3890,7 +3890,9 @@ async def run_member_add_order(order_id: int):
     added = 0
     failed = 0
     today = datetime.now(timezone.utc).date().isoformat()
-    for user_ref in users[:package_count]:
+    for user_ref in users:
+        if added >= package_count:
+            break
         async with aiosqlite.connect(DB_FILE) as db:
             daily = await db.execute_fetchall(
                 "SELECT added_count FROM member_add_daily_usage "
@@ -3937,7 +3939,7 @@ async def run_member_add_order(order_id: int):
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(
             "UPDATE member_add_orders SET status = ?, added_count = ?, failed_count = ? WHERE id = ?",
-            ("completed" if added else "failed", added, failed, order_id)
+            ("completed" if added >= package_count else "partial", added, failed, order_id)
         )
         await db.commit()
         if not await user_has_active_pro(user_id) and added > 0:
@@ -3948,12 +3950,14 @@ async def run_member_add_order(order_id: int):
                     (added, str(user_id)),
                 )
                 await db.commit()
+        target_status = "yakunlandi" if added >= package_count else "qisman yakunlandi"
         await bot.send_message(
-        int(user_id),
-        f"✅ <b>A'zo qo'shish yakunlandi</b>\n"
-        f"Qo'shildi: <b>{added}</b>\nO'tkazib yuborildi/xato: <b>{failed}</b>\n"
-        f"Kunlik limit: <b>{MEMBER_ADD_DAILY_LIMIT}</b>",
-    )
+            int(user_id),
+            f"✅ <b>A'zo qo'shish {target_status}</b>\n"
+            f"Buyurtma: <b>{package_count}</b>\n"
+            f"Qo'shildi: <b>{added}</b>\n"
+            f"Alternativalarga o'tkazildi: <b>{failed}</b>",
+        )
 
 
 def get_admin_member_add_keyboard(
@@ -4271,9 +4275,10 @@ async def create_member_add_order_from_pool(message: Message, state: FSMContext,
             await state.clear()
             _member_add_pending.pop(message.from_user.id, None)
             return
+        candidate_limit = max(package_count * 3, package_count)
         pool_rows = await db.execute_fetchall(
             "SELECT position, username FROM member_add_pool ORDER BY position LIMIT ?",
-            (package_count,),
+            (candidate_limit,),
         )
         users = [str(row[1]) for row in pool_rows]
         if not users:
