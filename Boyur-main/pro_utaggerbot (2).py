@@ -221,7 +221,6 @@ class UserStatesGroup(StatesGroup):
     member_add_users       = State()
     admin_member_add_price = State()
     admin_member_add_pool = State()
-    admin_member_add_bonus = State()
     contest_channel        = State()
     contest_max_users      = State()
     contest_req_channels   = State()
@@ -2008,6 +2007,20 @@ async def clone_payment_success(message: Message, state: FSMContext):
         if cursor.rowcount != 1:
             await message.answer("PRO buyurtmasi topilmadi yoki to'lov qayta ishlangan.")
             return
+        await grant_pro(str(message.from_user.id), 30)
+        await message.answer(
+            "✅ To'lov qabul qilindi!\n"
+            "💎 Sizga 30 kunlik PRO tarif faollashtirildi."
+        )
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"⭐ Yangi PRO to'lovi: {payment.total_amount} Stars\n"
+                f"User ID: <code>{message.from_user.id}</code>",
+            )
+        except Exception as exc:
+            log.warning("Ownerga to'lov bildirishi yuborilmadi: %s", exc)
+        return
     if payment.invoice_payload.startswith("member_add:"):
         parts = payment.invoice_payload.split(":")
         if len(parts) != 4:
@@ -2046,21 +2059,6 @@ async def clone_payment_success(message: Message, state: FSMContext):
             )
         except Exception as exc:
             log.warning("Ownerga member-add bildirgisi yuborilmadi: %s", exc)
-        return
-        await grant_pro(str(message.from_user.id), 30)
-        await message.answer(
-            "✅ To'lov qabul qilindi!\n"
-            "💎 Sizga 30 kunlik PRO tarif faollashtirildi."
-        )
-        try:
-            await bot.send_message(
-                ADMIN_ID,
-                f"⭐ Yangi PRO to'lovi: {payment.total_amount} Stars\n"
-                f"User ID: <code>{message.from_user.id}</code>\n"
-                f"Charge: <code>{payment.telegram_payment_charge_id}</code>",
-            )
-        except Exception as exc:
-            log.warning("Ownerga to'lov bildirishi yuborilmadi: %s", exc)
         return
     await message.answer("Bot klonini yaratish funksiyasi o'chirilgan.")
 
@@ -3848,46 +3846,9 @@ def get_member_add_packages_keyboard(daily_bonus: int = MEMBER_ADD_DAILY_BONUS) 
             text=f"👥 {count:,} azo",
             callback_data=f"member_add_package:{count}",
         ))
-    kb.row(InlineKeyboardButton(
-        text=f"🎁 Kunlik bonus: {daily_bonus} azo",
-        callback_data="member_add_daily_bonus",
-    ))
     kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="start"))
     return kb.as_markup()
 
-
-@dp.callback_query(F.data == "member_add_daily_bonus")
-async def cb_member_add_daily_bonus(callback: CallbackQuery):
-    owner_id = str(callback.from_user.id)
-    claim_date = datetime.now(timezone.utc).date().isoformat()
-    daily_bonus = await get_member_add_daily_bonus()
-    async with aiosqlite.connect(DB_FILE) as db:
-        row = await db.execute_fetchall(
-            "SELECT claimed_count FROM member_add_daily_bonus WHERE owner_id = ? AND claim_date = ?",
-            (owner_id, claim_date),
-        )
-        if row:
-            await callback.answer("Bugungi bonus allaqachon olingan.", show_alert=True)
-            return
-        await db.execute(
-            "INSERT INTO member_add_daily_bonus(owner_id, claim_date, claimed_count) VALUES (?, ?, 1)",
-            (owner_id, claim_date),
-        )
-        await db.execute(
-            "INSERT INTO member_add_credits(owner_id, remaining_count) VALUES (?, ?) "
-            "ON CONFLICT(owner_id) DO UPDATE "
-            "SET remaining_count = remaining_count + excluded.remaining_count",
-            (owner_id, daily_bonus),
-        )
-        await db.commit()
-        credit_row = await db.execute_fetchall(
-            "SELECT remaining_count FROM member_add_credits WHERE owner_id = ?", (owner_id,)
-        )
-    balance = int(credit_row[0][0]) if credit_row else daily_bonus
-    await callback.answer(
-        f"🎁 Bonus olindi: +{daily_bonus} azo. Jami kredit: {balance}",
-        show_alert=True,
-    )
 
 
 async def get_member_add_prices() -> dict[int, int]:
@@ -4009,10 +3970,6 @@ def get_admin_member_add_keyboard(
         InlineKeyboardButton(text="🗑 Bazani tozalash", callback_data="admin_member_pool_clear"),
     )
     kb.row(InlineKeyboardButton(text="📊 Admin baza soni", callback_data="admin_member_pool_count"))
-    kb.row(InlineKeyboardButton(
-        text=f"🎁 Kunlik bonus: {daily_bonus} azo",
-        callback_data="admin_member_bonus",
-    ))
     kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin_panel"))
     return kb.as_markup()
 
@@ -4032,40 +3989,6 @@ async def get_member_add_daily_bonus() -> int:
         return max(0, min(50_000, int(row[0][0])))
     except (IndexError, TypeError, ValueError):
         return MEMBER_ADD_DAILY_BONUS
-
-
-@dp.callback_query(F.data == "admin_member_bonus")
-async def cb_admin_member_bonus(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Faqat owner uchun", show_alert=True)
-        return
-    bonus = await get_member_add_daily_bonus()
-    await state.set_state(UserStatesGroup.admin_member_add_bonus)
-    await callback.message.edit_text(
-        f"🎁 Kunlik bonus miqdorini raqamda yuboring.\nHozirgi bonus: <b>{bonus}</b> azo."
-    )
-    await callback.answer()
-
-
-@dp.message(StateFilter(UserStatesGroup.admin_member_add_bonus), F.text)
-async def admin_member_bonus_input(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        return
-    try:
-        bonus = int(message.text.strip().replace(" ", ""))
-        if not 0 <= bonus <= 50_000:
-            raise ValueError
-        async with aiosqlite.connect(DB_FILE) as db:
-            await db.execute(
-                "INSERT INTO bot_settings(key, value) VALUES ('member_add_daily_bonus', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (str(bonus),),
-            )
-            await db.commit()
-        await state.clear()
-        await message.answer(f"✅ Kunlik bonus <b>{bonus}</b> azoga sozlandi.")
-    except ValueError:
-        await message.answer("0 dan 50,000 gacha butun son yuboring.")
 
 
 @dp.callback_query(F.data == "admin_member_pool_import")
@@ -4142,11 +4065,10 @@ async def cb_admin_member_add(callback: CallbackQuery):
         await callback.answer("Faqat owner uchun", show_alert=True)
         return
     prices = await get_member_add_prices()
-    daily_bonus = await get_member_add_daily_bonus()
     await callback.message.edit_text(
         "👥 <b>A'zo qo'shish paketlari</b>\n"
         f"Kunlik limit: <b>{MEMBER_ADD_DAILY_LIMIT} ta</b>\nPaket narxini o'zgartirish uchun boshing:",
-        reply_markup=get_admin_member_add_keyboard(prices, daily_bonus),
+        reply_markup=get_admin_member_add_keyboard(prices),
     )
 
 
@@ -4186,8 +4108,7 @@ async def admin_member_add_price_input(message: Message, state: FSMContext):
             f"{format_member_add_price(price)}"
         )
         prices = await get_member_add_prices()
-        daily_bonus = await get_member_add_daily_bonus()
-        await message.answer("👥 Paketlar:", reply_markup=get_admin_member_add_keyboard(prices, daily_bonus))
+        await message.answer("👥 Paketlar:", reply_markup=get_admin_member_add_keyboard(prices))
     except ValueError:
         await message.answer("Faqat 0 yoki musbat butun son kiriting.")
 
@@ -4204,8 +4125,7 @@ async def cb_member_add_start(callback: CallbackQuery):
         lines.append("🆓 Sinov faolligi: kuniga 20 ta, 5 kun.")
     for count in MEMBER_ADD_PACKAGES:
         lines.append(f"• {count:,} azo - <b>{format_member_add_price(prices[count])}</b>")
-    daily_bonus = await get_member_add_daily_bonus()
-    await callback.message.edit_text("\n".join(lines), reply_markup=get_member_add_packages_keyboard(daily_bonus))
+    await callback.message.edit_text("\n".join(lines), reply_markup=get_member_add_packages_keyboard())
 
 
 @dp.callback_query(F.data == "member_add_limit")
