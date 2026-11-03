@@ -2629,6 +2629,7 @@ async def do_utag(client: TelegramClient, uid: str, event, random_mode: bool = F
         async def send_member_tag(
             text: str,
             entities: list[MessageEntityCustomEmoji | MessageEntityMentionName],
+            parse_mode: str | None = None,
         ):
             nonlocal tagged
             while True:
@@ -2637,7 +2638,7 @@ async def do_utag(client: TelegramClient, uid: str, event, random_mode: bool = F
                         chat,
                         text,
                         formatting_entities=entities or None,
-                        parse_mode=None,
+                        parse_mode=parse_mode,
                     )
                     tagged += 1
                     break
@@ -2654,7 +2655,7 @@ async def do_utag(client: TelegramClient, uid: str, event, random_mode: bool = F
                                 chat,
                                 text,
                                 formatting_entities=mention_entities or None,
-                                parse_mode=None,
+                                parse_mode=parse_mode,
                             )
                             tagged += 1
                             break
@@ -2672,15 +2673,25 @@ async def do_utag(client: TelegramClient, uid: str, event, random_mode: bool = F
                 continue
             seen_user_ids.add(user_id)
             try:
+                parse_mode = None
                 if random_mode:
                     tag_text, entities = make_random_utag_text(
                         user, random_words=random_words
                     )
                 else:
                     mention = get_user_mention_name(user)
-                    tag_text = make_text_unique(mention)
-                    entities = get_user_mention_entities(user, mention)
-                await send_member_tag(tag_text, entities)
+                    if getattr(user, "username", None):
+                        tag_text = make_text_unique(mention)
+                        entities = []
+                        parse_mode = None
+                    else:
+                        tag_text = (
+                            f'<a href="tg://user?id={user.id}">'
+                            f"{html.escape(make_text_unique(mention))}</a>"
+                        )
+                        entities = []
+                        parse_mode = "html"
+                await send_member_tag(tag_text, entities, parse_mode=parse_mode)
             except FloodWaitError as e:
                 await asyncio.sleep(e.seconds + 5)
             except (UserPrivacyRestrictedError, PeerFloodError):
