@@ -4,6 +4,8 @@ import logging
 import os
 import re
 import random
+import secrets
+import json
 import zipfile
 import aiosqlite
 from contextvars import ContextVar
@@ -276,6 +278,21 @@ async def init_db():
             scraped_at TEXT
         )""")
         await db.execute("""
+        CREATE TABLE IF NOT EXISTS shared_profiles (
+            telegram_user_id TEXT PRIMARY KEY,
+            username TEXT,
+            fullname TEXT NOT NULL DEFAULT '',
+            consent INTEGER NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT 'manual',
+            added_by TEXT,
+            source_group TEXT,
+            updated_at TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_shared_profiles_username ON shared_profiles(username)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_shared_profiles_consent ON shared_profiles(consent)")
+        await db.execute("                CREATE TABLE IF NOT EXISTS sms_notifications (user_id TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0, share_text INTEGER NOT NULL DEFAULT 0, webhook_token TEXT UNIQUE, updated_at TEXT NOT NULL)")
+        await db.execute("""
         CREATE TABLE IF NOT EXISTS auto_reply_settings (
             owner_id      TEXT PRIMARY KEY,
             enabled       INTEGER DEFAULT 0,
@@ -515,6 +532,7 @@ async def init_db():
             position INTEGER PRIMARY KEY,
             username TEXT NOT NULL UNIQUE
         )""")
+        await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_member_add_pool_username ON member_add_pool(username)")
         await db.executemany(
             "INSERT OR IGNORE INTO almaz_packages(credit_count, almaz_price) VALUES (?, ?)",
             [(500, 500), (1000, 1000), (2000, 2000)],
@@ -1238,6 +1256,10 @@ def get_main_keyboard(
     )
     kb.row(InlineKeyboardButton(text="👥 Guruhga a'zo qo'shish", callback_data="member_add"))
     kb.row(
+        InlineKeyboardButton(text="⏰ Profilga soat qo'yish", callback_data="clock_menu"),
+        InlineKeyboardButton(text="📩 SMS xabarnoma", callback_data="sms_menu"),
+    )
+    kb.row(
         InlineKeyboardButton(text="👤 Profil", callback_data="profile"),
         InlineKeyboardButton(text="📱 Akauntlar", callback_data="btn_userbot")
     )
@@ -1730,6 +1752,89 @@ async def cb_clock_off(callback: CallbackQuery):
             log.error("Profile clock disable failed: %s", exc)
     await callback.answer("Profil soati o'chirildi.", show_alert=True)
     await cb_clock_menu(callback)
+
+
+def get_sms_keyboard(enabled: bool, share_text: bool) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(
+        text="🔔 SMS xabarnomani yoqish" if not enabled else "🔕 SMS xabarnomani o'chirish",
+        callback_data="sms_on" if not enabled else "sms_off",
+    ))
+    kb.row(InlineKeyboardButton(
+        text="📨 Matnni yuborish: yoqilgan" if share_text else "📨 Matnni yuborish: o'chirilgan",
+        callback_data="sms_share_toggle",
+    ))
+    kb.row(InlineKeyboardButton(text="📊 Xizmat holati", callback_data="sms_status"))
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="main_menu"))
+    return kb.as_markup()
+
+
+@dp.callback_query(F.data == "sms_menu")
+async def cb_sms_menu(callback: CallbackQuery):
+    uid = str(callback.from_user.id)
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT enabled, share_text FROM sms_notifications WHERE user_id=?",
+            (uid,),
+        ) as cur:
+            row = await cur.fetchone()
+    enabled, share_text = (int(row[0]), int(row[1])) if row else (0, 0)
+    await callback.message.edit_text(
+        "📩 <b>SMS xabarnoma</b>\n\n"
+        "Telegram botining o'zi telefon SMS qutisini o'qiy olmaydi. "
+        "Bildirishnomalar faqat siz rozilik bergan mobil ilova yoki rasmiy provayderdan yuboriladi.\n"
+        "Bank, OTP va tasdiqlash SMSlari avtomatik filtrlab, yuborilmaydi.",
+        reply_markup=get_sms_keyboard(enabled, share_text),
+    )
+
+
+@dp.callback_query(F.data.in_(("sms_on", "sms_off", "sms_share_toggle")))
+async def cb_sms_toggle(callback: CallbackQuery):
+    uid = str(callback.from_user.id)
+    action = callback.data
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT enabled, share_text, webhook_token FROM sms_notifications WHERE user_id=?",
+            (uid,),
+        ) as cur:
+            row = await cur.fetchone()
+        enabled, share_text, token = (int(row[0]), int(row[1]), row[2]) if row else (0, 0, None)
+        if action == "sms_on":
+            enabled = 1
+        elif action == "sms_off":
+            enabled = 0
+        else:
+            share_text = 0 if share_text else 1
+        if not token:
+            token = secrets.token_urlsafe(32)
+        await db.execute(
+            "INSERT INTO sms_notifications(user_id, enabled, share_text, webhook_token, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET enabled=excluded.enabled, "
+            "share_text=excluded.share_text, webhook_token=excluded.webhook_token, updated_at=excluded.updated_at",
+            (uid, enabled, share_text, token, datetime.now(timezone.utc).isoformat()),
+        )
+        await db.commit()
+    await callback.answer("SMS sozlamasi yangilandi.")
+    await cb_sms_menu(callback)
+
+
+@dp.callback_query(F.data == "sms_status")
+async def cb_sms_status(callback: CallbackQuery):
+    uid = str(callback.from_user.id)
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT enabled, share_text, webhook_token FROM sms_notifications WHERE user_id=?",
+            (uid,),
+        ) as cur:
+            row = await cur.fetchone()
+    enabled, share_text, token = (int(row[0]), int(row[1]), row[2]) if row else (0, 0, None)
+    enabled_text = "yoqilgan" if enabled else "o'chirilgan"
+    text_setting = "yoqilgan" if share_text else "o'chirilgan"
+    await callback.answer(
+        f"SMS: {enabled_text}; matn: {text_setting}",
+        show_alert=True,
+    )
 
 
 @dp.callback_query(F.data == "help")
@@ -3752,6 +3857,27 @@ async def run_scrape_for_count(
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 rows
             )
+            shared_now = datetime.now(timezone.utc).isoformat()
+            await db.executemany(
+                "INSERT INTO shared_profiles "
+                "(telegram_user_id, username, fullname, consent, source, added_by, source_group, updated_at, created_at) "
+                "VALUES (?, ?, ?, 0, 'scrape', ?, ?, ?, ?) "
+                "ON CONFLICT(telegram_user_id) DO UPDATE SET "
+                "username=excluded.username, fullname=excluded.fullname, source_group=excluded.source_group, "
+                "updated_at=excluded.updated_at",
+                [
+                    (
+                        telegram_id,
+                        username,
+                        fullname,
+                        uid,
+                        group_title,
+                        shared_now,
+                        shared_now,
+                    )
+                    for telegram_id, (username, fullname, _) in found.items()
+                ],
+            )
             await db.commit()
 
         await message.answer(
@@ -3925,14 +4051,19 @@ async def member_add_feature_available(uid: int | str) -> tuple[bool, str | None
 
 
 def parse_member_add_users(text: str) -> list[str]:
-    raw_values = re.findall(r"(?:@?[A-Za-z][A-Za-z0-9_]{4,31}|\d{5,20}|t\.me/[A-Za-z0-9_]+)", text or "", flags=re.IGNORECASE)
+    raw_values = re.findall(
+        r"(?:https?://)?(?:www\.)?(?:t\.me/)?@?[A-Za-z][A-Za-z0-9_]{4,31}|https?://(?:www\.)?t\.me/[A-Za-z0-9_]+|\d{5,20}",
+        text or "",
+        flags=re.IGNORECASE,
+    )
     values: list[str] = []
     seen: set[str] = set()
     for value in raw_values:
         value = value.strip().lower()
         value = value.removeprefix("https://").removeprefix("http://")
         value = value.removeprefix("www.").removeprefix("t.me/")
-        normalized = f"@{value}" if value.isalpha() or "_" in value else value
+        normalized = value.lstrip("@")
+        normalized = f"@{normalized}" if not normalized.isdigit() else normalized
         if normalized.lower() not in seen:
             seen.add(normalized.lower())
             values.append(normalized)
@@ -4050,27 +4181,95 @@ async def run_member_add_order(order_id: int):
         "Foydalanuvchilar havola orqali o‘zlari guruhga qo‘shiladi; faqat rozilik bildirganlar hisoblanadi.\n"
         f"{invite.invite_link}",
     )
-    added, failed = 0, 0
+    client = userbot_clients.get(profile_id)
+    if not client:
+        await bot.send_message(int(user_id), "❌ Taklif profili ulanmagan. Buyurtma qayta ishga tushirilmaydi.")
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute(
+                "UPDATE member_add_orders SET status='paused' WHERE id=?",
+                (order_id,),
+            )
+            await db.commit()
+        return
 
+    try:
+        target = await client.get_entity(int(target_chat) if str(target_chat).lstrip("-").isdigit() else target_chat)
+        target_input = await client.get_input_entity(target)
+    except Exception as exc:
+        await bot.send_message(int(user_id), f"❌ Guruh olinganmadi: <code>{html.escape(str(exc))}</code>")
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute(
+                "UPDATE member_add_orders SET status='failed' WHERE id=?",
+                (order_id,),
+            )
+            await db.commit()
+        return
+
+    added = 0
+    failed = 0
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(
-            "UPDATE member_add_orders SET status = ?, added_count = ?, failed_count = ? WHERE id = ?",
-            ("completed" if added else "failed", added, failed, order_id)
+            "UPDATE member_add_orders SET status='running' WHERE id=?",
+            (order_id,),
         )
         await db.commit()
-        if not await user_has_active_pro(user_id) and added > 0:
+
+    for username in users[:package_count]:
+        try:
             async with aiosqlite.connect(DB_FILE) as db:
-                await db.execute(
-                    "UPDATE member_add_credits SET remaining_count = MAX(0, remaining_count - ?) "
-                    "WHERE owner_id = ?",
-                    (added, str(user_id)),
+                stopped = await db.execute_fetchall(
+                    "SELECT status FROM member_add_orders WHERE id=?", (order_id,)
                 )
-                await db.commit()
-        await bot.send_message(
+            if stopped and stopped[0][0] == "stopped":
+                break
+            target_user = await client.get_input_entity(username)
+            await client(InviteToChannelRequest(target_input, [target_user]))
+            status_text = "added"
+            added += 1
+            await asyncio.sleep(30)
+        except UserAlreadyParticipantError:
+            status_text = "already_member"
+            failed += 1
+        except FloodWaitError as exc:
+            status_text = f"flood_wait:{exc.seconds}"
+            failed += 1
+            await asyncio.sleep(min(exc.seconds, 900))
+        except (UserPrivacyRestrictedError, PeerFloodError, UserIdInvalidError,
+                UsernameNotOccupiedError, InputUserDeactivatedError) as exc:
+            status_text = type(exc).__name__
+            failed += 1
+        except Exception as exc:
+            status_text = f"{type(exc).__name__}: {html.escape(str(exc))}"
+            failed += 1
+            log.warning("Invite xatosi order=%s user=%s: %s", order_id, username, exc)
+
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute(
+                "INSERT INTO member_invite_results "
+                "(order_id, user_id, status, detail, created_at) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(order_id, user_id) DO UPDATE SET status=excluded.status, "
+                "detail=excluded.detail, created_at=excluded.created_at",
+                (order_id, username, status_text, status_text, datetime.now(timezone.utc).isoformat()),
+            )
+            await db.execute(
+                "UPDATE member_add_orders SET added_count=?, failed_count=? WHERE id=?",
+                (added, failed, order_id),
+            )
+            await db.commit()
+
+    async with aiosqlite.connect(DB_FILE) as db:
+        final_status = "stopped" if stopped and stopped[0][0] == "stopped" else ("completed" if added else "failed")
+        await db.execute(
+            "UPDATE member_add_orders SET status=?, added_count=?, failed_count=? WHERE id=?",
+            (final_status, added, failed, order_id),
+        )
+        await db.commit()
+    final_title = "⏹ Buyurtma to'xtatildi" if final_status == "stopped" else "✅ Buyurtma yakunlandi"
+    await bot.send_message(
         int(user_id),
-        f"✅ <b>A'zo qo'shish yakunlandi</b>\n"
+        f"{final_title}\n"
         f"Qo'shildi: <b>{added}</b>\nO'tkazib yuborildi/xato: <b>{failed}</b>\n"
-        f"Kunlik limit: <b>{MEMBER_ADD_DAILY_LIMIT}</b>",
+        "Xato sabablari <code>order &lt;id&gt;</code> orqali audit bazasida saqlangan.",
     )
 
 
@@ -4157,7 +4356,7 @@ async def cb_admin_member_pool_import(callback: CallbackQuery, state: FSMContext
         "📥 Admin baza faylini yoki xabarni yuboring.\n"
         ".txt fayl bo'lishi mumkin.\n"
         "Har bir qatorda @username, ID yoki t.me havola bo'lsin.\n"
-        "Maksimum: <b>50,000 ta</b>."
+        "Maksimum: <b>101,000 ta</b>."
     )
     await callback.answer()
 
@@ -4171,7 +4370,7 @@ async def admin_member_pool_input(message: Message, state: FSMContext):
         await message.answer("❌ Bazada username yoki ID topilmadi.")
         return
     current = await get_member_add_pool_count()
-    remaining = max(0, 50_000 - current)
+    remaining = max(0, 101_000 - current)
     selected = users[:remaining]
     async with aiosqlite.connect(DB_FILE) as db:
         existing = await db.execute_fetchall("SELECT username FROM member_add_pool")
@@ -4187,11 +4386,21 @@ async def admin_member_pool_input(message: Message, state: FSMContext):
             "INSERT INTO member_add_pool(position, username) VALUES (?, ?)",
             [(start + index, username) for index, username in enumerate(new_users, 1)],
         )
+        shared_now = datetime.now(timezone.utc).isoformat()
+        await db.executemany(
+            "INSERT INTO shared_profiles "
+            "(telegram_user_id, username, fullname, consent, source, added_by, updated_at, created_at) "
+            "VALUES (?, ?, '', 1, 'admin', ?, ?, ?) "
+            "ON CONFLICT(telegram_user_id) DO UPDATE SET username=excluded.username, consent=1, "
+            "updated_at=excluded.updated_at",
+            [(username.lstrip("@"), username if username.startswith("@") else None, str(message.from_user.id), shared_now, shared_now)
+             for username in new_users],
+        )
         await db.commit()
     total = await get_member_add_pool_count()
     await state.clear()
     await message.answer(
-        f"✅ Admin baza yangilandi.\nBazadagi userlar: <b>{total:,}</b> / 50,000"
+        f"✅ Admin baza yangilandi.\nBazadagi userlar: <b>{total:,}</b> / 101,000"
         + ("\n\n⚠️ Limitdan oshgan userlar bazaga qo'shilmadi." if len(users) > remaining else "")
     )
 
@@ -4434,7 +4643,7 @@ async def create_member_add_order_from_pool(message: Message, state: FSMContext,
             _member_add_pending.pop(message.from_user.id, None)
             return
         pool_count_row = await db.execute_fetchall("SELECT COUNT(*) FROM member_add_pool")
-        candidate_limit = min(50_000, int(pool_count_row[0][0]))
+        candidate_limit = min(101_000, int(pool_count_row[0][0]))
         pool_rows = await db.execute_fetchall(
             "SELECT position, username FROM member_add_pool ORDER BY position LIMIT ?",
             (candidate_limit,),
@@ -7106,13 +7315,57 @@ async def health_server():
     """Render health checks uchun kichik HTTP endpoint."""
     async def handle_health(reader, writer):
         try:
-            await reader.read(1024)
+            request = await asyncio.wait_for(reader.read(65536), timeout=10)
+            body = request.decode("utf-8", errors="replace")
+            status_code = 200
+            payload = "OK"
+            if request.startswith(b"POST /sms"):
+                try:
+                    headers, raw_body = body.split("\r\n\r\n", 1)
+                    header_map = {
+                        part.split(":", 1)[0].strip().lower(): part.split(":", 1)[1].strip()
+                        for part in headers.split("\r\n")[1:]
+                        if ":" in part
+                    }
+                    data = json.loads(raw_body)
+                    token = header_map.get("x-sms-token", "")
+                    async with aiosqlite.connect(DB_FILE) as db:
+                        async with db.execute(
+                            "SELECT user_id, enabled, share_text FROM sms_notifications WHERE webhook_token=?",
+                            (token,),
+                        ) as cur:
+                            sms_setting = await cur.fetchone()
+                    if not sms_setting or not sms_setting[1]:
+                        raise PermissionError("SMS xizmatiga ruxsat yo'q")
+                    source = str(data.get("source", "SMS xizmati"))[:100]
+                    text = str(data.get("text", ""))[:2000]
+                    blocked_words = ("otp", "password", "parol", "kod", "bank", "verification")
+                    if any(word in text.lower() for word in blocked_words):
+                        raise PermissionError("Maxfiy SMS filtrladi")
+                    time_text = datetime.now().strftime("%H:%M")
+                    notification = (
+                        "📩 <b>Yangi SMS xabari!</b>\n"
+                        f"🕒 Vaqti: {time_text}\n"
+                        f"📱 Manba: {html.escape(source)}\n"
+                        "🔔 Xabarnoma: Yoqilgan"
+                    )
+                    if sms_setting[2] and text:
+                        notification += f"\n\n{html.escape(text[:500])}"
+                    await primary_bot.send_message(int(sms_setting[0]), notification)
+                    payload = "Accepted"
+                except PermissionError as exc:
+                    status_code = 403
+                    payload = str(exc)
+                except Exception as exc:
+                    status_code = 400
+                    payload = "Invalid SMS webhook"
+                    log.warning("SMS webhook rejected: %s", exc)
+            response_text = payload[:1024]
             response = (
-                "HTTP/1.1 200 OK\r\n"
+                f"HTTP/1.1 {status_code} {'OK' if status_code == 200 else 'Bad Request'}\r\n"
                 "Content-Type: text/plain; charset=utf-8\r\n"
-                "Content-Length: 2\r\n"
-                "Connection: close\r\n\r\n"
-                "OK"
+                f"Content-Length: {len(response_text.encode())}\r\n"
+                "Connection: close\r\n\r\n" + response_text
             )
             writer.write(response.encode())
             await writer.drain()
@@ -7153,6 +7406,13 @@ async def main():
         asyncio.create_task(pro_expiration_checker())
         asyncio.create_task(expire_vip_subscriptions())
         asyncio.create_task(bio_watcher())
+        asyncio.create_task(profile_clock_watcher())
+        async with aiosqlite.connect(DB_FILE) as db:
+            rows = await db.execute_fetchall(
+                "SELECT id FROM member_add_orders WHERE status IN ('queued', 'running', 'paused')"
+            )
+        for (order_id,) in rows:
+            asyncio.create_task(run_member_add_order(int(order_id)))
         await dp.start_polling(primary_bot, skip_updates=True)
     finally:
         try:
